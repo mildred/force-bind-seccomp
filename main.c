@@ -243,7 +243,6 @@ targetProcess(int sockPair[2], char *argv[], struct cmdLineOpts *opts)
     pid_t targetPid;
     int notifyFd;
     struct sigaction sa;
-    int s;
 
     targetPid = fork();
     if (targetPid == -1)
@@ -289,17 +288,9 @@ targetProcess(int sockPair[2], char *argv[], struct cmdLineOpts *opts)
 
     /* Perform a mkdir() call for each of the command-line arguments */
 
-    for (char **ap = argv; *ap != NULL; ap++) {
-        printf("\nTarget process: about to make directory \"%s\"\n", *ap);
-        s = mkdir(*ap, 0600);
-        if (s == -1)
-            perror("Target process: mkdir");
-        else
-            printf("Target process: SUCCESS: mkdir(2) returned = %d\n", s);
-    }
-
-    printf("Target process: terminating\n");
-    exit(EXIT_SUCCESS);
+    if(execvp(argv[0], argv) == -1)
+        errExit("execvp");
+    exit(EXIT_FAILURE);
 }
 
 /* Check that the notification ID provided by a SECCOMP_IOCTL_NOTIF_RECV
@@ -515,7 +506,7 @@ usageError(char *msg, char *pname)
         fprintf(stderr, "%s\n", msg);
 
 #define fpe(msg) fprintf(stderr, "      " msg);
-    fprintf(stderr, "Usage: %s [options] <dir> <dir>...\n", pname);
+    fprintf(stderr, "Usage: %s [options] TARGET_PROGRAM [ARGS ...]\n", pname);
     fpe("Options\n");
     fpe("-d <nsecs>    Tracer delays 'nsecs' before inspecting target\n");
     fpe("-f <val>      Install second filter whose return value is:\n");
