@@ -78,10 +78,34 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include "scm_functions.h"
 
 #define errExit(msg)    do { perror(msg); exit(EXIT_FAILURE); \
                         } while (0)
+
+static char *
+get_ip_str(const struct sockaddr *sa, char *s, size_t maxlen)
+{
+    switch(sa->sa_family) {
+        case AF_INET:
+            inet_ntop(AF_INET, &(((struct sockaddr_in *)sa)->sin_addr),
+                    s, maxlen);
+            break;
+
+        case AF_INET6:
+            inet_ntop(AF_INET6, &(((struct sockaddr_in6 *)sa)->sin6_addr),
+                    s, maxlen);
+            break;
+
+        default:
+            return NULL;
+    }
+
+    return s;
+}
 
 static int
 seccomp(unsigned int operation, unsigned int flags, void *args)
@@ -127,9 +151,9 @@ installNotifyFilter(void)
     struct sock_filter filter[] = {
         X86_64_CHECK_ARCH_AND_LOAD_SYSCALL_NR,
 
-        /* mkdir() triggers notification to user-space tracer */
+        /* bind() triggers notification to user-space tracer */
 
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_mkdir, 0, 1),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_bind, 0, 1),
         BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_USER_NOTIF),
 
         /* Every other system call is allowed */
@@ -158,7 +182,7 @@ installNotifyFilter(void)
 /* installFilter2() optionally installs a second BPF filter in order to allow
    experiments with the precedence of SECCOMP_RET_USER_NOTIF relative to other
    filter return values. As with the other filter, this filter performs special
-   treatment of mkdir(2) and allows all other system calls. */
+   treatment of bind(2) and allows all other system calls. */
 
 static void
 installFilter2(struct cmdLineOpts *opts)
@@ -166,9 +190,9 @@ installFilter2(struct cmdLineOpts *opts)
     struct sock_filter filter[] = {
         X86_64_CHECK_ARCH_AND_LOAD_SYSCALL_NR,
 
-        /* Treat mkdir() system calls specially */
+        /* Treat bind() system calls specially */
 
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_mkdir, 1, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_bind, 1, 0),
 
         /* Every other system call is allowed */
 
@@ -233,7 +257,7 @@ closeSocketPair(int sockPair[2])
        flag;
    (2) writes the seccomp notification file descriptor returned from the
        previous step onto the UNIX domain socket, 'sockPair[0]';
-   (3) calls mkdir(2) for each element of 'argv'.
+   (3) exec into the designated process.
 
    The function return value is the PID of the child process. */
 
@@ -286,7 +310,7 @@ targetProcess(int sockPair[2], char *argv[], struct cmdLineOpts *opts)
 
     closeSocketPair(sockPair);
 
-    /* Perform a mkdir() call for each of the command-line arguments */
+    /* Exec into the designated process */
 
     if(execvp(argv[0], argv) == -1)
         errExit("execvp");
@@ -318,6 +342,8 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
     struct seccomp_notif *req;
     struct seccomp_notif_resp *resp;
     struct seccomp_notif_sizes sizes;
+    socklen_t addrlen;
+    struct sockaddr *addr;
     char path[PATH_MAX];
     int procMem;        /* FD for /proc/PID/mem of target process */
 
@@ -339,8 +365,10 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
     /* Loop handling notifications */
 
     for (;;) {
-
         /* Wait for next notification, returning info in '*req' */
+
+        bzero(req, sizes.seccomp_notif);
+        bzero(resp, sizes.seccomp_notif_resp);
 
         if (ioctl(notifyFd, SECCOMP_IOCTL_NOTIF_RECV, req) == -1)
             errExit("Tracer: ioctlSECCOMP_IOCTL_NOTIF_RECV");
@@ -374,11 +402,11 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
         }
 
         /* Access the memory of the target process in order to discover
-           the pathname that was given to mkdir() */
+           the syscall arguments */
 
         snprintf(path, sizeof(path), "/proc/%d/mem", req->pid);
 
-        procMem = open(path, O_RDONLY);
+        procMem = open(path, O_RDWR);
         if (procMem == -1)
             errExit("Tracer: open");
 
@@ -402,10 +430,19 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
         /* Seek to the location containing the pathname argument (i.e., the
            first argument) of the mkdir(2) call and read that pathname */
 
-        if (lseek(procMem, req->data.args[0], SEEK_SET) == -1)
+        int socketfd = req->data.args[0];
+        intptr_t addrptr = req->data.args[1];
+        size_t addrlen = req->data.args[2];
+        printf("Tracer: bind(%d, 0x%llx, %lld, %lld, %lld, %llx)\n", socketfd, addrptr, addrlen, req->data.args[3], req->data.args[4], req->data.args[5]);
+
+        if (lseek(procMem, addrptr, SEEK_SET) == -1)
             errExit("Tracer: lseek");
 
-        ssize_t s = read(procMem, path, sizeof(path));
+        addr = malloc(addrlen);
+        if (resp == NULL)
+            errExit("Tracer: malloc");
+
+        ssize_t s = read(procMem, addr, addrlen);
         if (s == -1)
             errExit("read");
         else if (s == 0) {
@@ -413,30 +450,67 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
             exit(EXIT_FAILURE);
         }
 
-        printf("Tracer: mkdir(\"%s\", %llo)\n", path, req->data.args[1]);
+        for(int i = 0; i < addrlen; ++i) {
+            if(i == 0) printf("Tracer bind addr:");
+            printf(" %02x", ((char*) addr)[i]);
+            if(i == addrlen - 1) printf("\n");
+        }
 
-        if (close(procMem) == -1)
-            errExit("close-/proc/PID/mem");
+        char addrstring[PATH_MAX];
+        printf("Tracer: bind(%d, %s)\n", socketfd, get_ip_str(addr, addrstring, PATH_MAX));
 
         /* The response to the notification includes the notification ID */
 
         resp->id = req->id;
         resp->flags = 0;        /* Must be zero as at Linux 5.0 */
+        resp->val = 0;          /* Success return value is 0 */
+        resp->error = 0;
 
-        /* Success return value is the length of the pathname given to
-           mkdir() */
+        if (addr->sa_family != AF_INET && addr->sa_family != AF_INET6) {
 
-        resp->val = strlen(path);
+            /* Continue the syscall. This is not secure at all, but we don't
+             * care for now */
 
-        /* If the directory is in /tmp, then create it on behalf of the tracer;
-           give an error for a directory pathname in any other location. */
+            resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
 
-        if (strncmp(path, "/tmp/", strlen("/tmp/")) == 0) {
-            mkdir(path, req->data.args[1]);
-            resp->error = 0;
         } else {
-            resp->error = -EPERM;
+
+            /* Continue the syscall. ideally we should filter the IP address and
+             * make sure it is allowed, but this is not yet implemented */
+
+            // use ptrace (most secure) https://github.com/briceburg/fdclose/blob/master/src/ptrace_do/libptrace_do.c
+            // (but will that call seccomp recursively ???)
+            // or modify process memory and return with SECCOMP_USER_NOTIF_FLAG_CONTINUE
+
+            /*
+            snprintf(path, sizeof(path), "/proc/%d/fd/%d", req->pid, socketfd);
+
+            int sock = open(path, 0);
+            if (sock == -1)
+                errExit("Tracer: open(sock)");
+
+            resp->error = bind(sock, addr, addrlen);
+
+            printf("Tracer: bind() = %d", resp->error);
+            */
+
+            resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+
+            if (lseek(procMem, addrptr, SEEK_SET) == -1)
+                errExit("Tracer: lseek");
+
+            ssize_t s = write(procMem, addr, addrlen);
+            if (s == -1)
+                errExit("read");
+            else if (s != addrlen) {
+                fprintf(stderr, "Tracer: short write\n");
+                exit(EXIT_FAILURE);
+            }
+
         }
+
+        if (close(procMem) == -1)
+            errExit("close-/proc/PID/mem");
 
         /* Provide a response to the target process */
 
@@ -446,15 +520,6 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                         "process's syscall was interrupted by signal?\n");
             else
                 perror("ioctl-SECCOMP_IOCTL_NOTIF_SEND");
-        }
-
-        /* If the pathname is just "/bye", then the tracer terminates. This
-           allows us to see what happens if the target process makes further
-           calls to mkdir(2). */
-
-        if (strcmp(path, "/bye") == 0) {
-            printf("Tracer: terminating <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<\n");
-            exit(EXIT_FAILURE);
         }
     }
 }
