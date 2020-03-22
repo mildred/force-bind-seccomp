@@ -117,7 +117,6 @@ seccomp(unsigned int operation, unsigned int flags, void *args)
 
 struct cmdLineOpts {
     int  delaySecs;     /* Delay time for responding to notifications */
-    int  secondFilter;  /* Install a second BPF filter? */
     bool killTracer;    /* Kill tracer when target has died? */
 };
 
@@ -177,56 +176,6 @@ installNotifyFilter(void)
         errExit("seccomp-install-notify-filter");
 
     return notifyFd;
-}
-
-/* installFilter2() optionally installs a second BPF filter in order to allow
-   experiments with the precedence of SECCOMP_RET_USER_NOTIF relative to other
-   filter return values. As with the other filter, this filter performs special
-   treatment of bind(2) and allows all other system calls. */
-
-static void
-installFilter2(struct cmdLineOpts *opts)
-{
-    struct sock_filter filter[] = {
-        X86_64_CHECK_ARCH_AND_LOAD_SYSCALL_NR,
-
-        /* Treat bind() system calls specially */
-
-        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_bind, 1, 0),
-
-        /* Every other system call is allowed */
-
-        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-
-        /* The last entry in the BPF program will be replaced by a "return"
-           instruction; see below */
-
-        { 0, 0, 0, 0 },
-    };
-
-    struct sock_fprog prog = {
-        .len = (unsigned short) (sizeof(filter) / sizeof(filter[0])),
-        .filter = filter,
-    };
-
-    /* Depending on the value of the "-f" command-line option, place either
-       a SECCOMP_RET_ERRNO instruction in the BPF program, or otherwise a
-       SECCOMP_RET_TRACE instruction. This can be used to illustrate that
-       SECCOMP_RET_ERRNO has higher precedence than the SECCOMP_RET_USER_NOTIF
-       returned by the other filter, with the result that the user-space
-       notification will not occur. By contrast, SECCOMP_RET_TRACE has lower
-       precedence (so that the user-space notification does occur). */
-
-    const struct sock_filter retTrace = BPF_STMT(BPF_RET + BPF_K,
-                                              SECCOMP_RET_TRACE);
-    const struct sock_filter retErrno = BPF_STMT(BPF_RET + BPF_K,
-                                              SECCOMP_RET_ERRNO | ENOTSUP);
-
-    filter[prog.len - 1] = (opts->secondFilter == SECCOMP_RET_ERRNO) ?
-                                        retErrno : retTrace;
-
-    if (seccomp(SECCOMP_SET_MODE_FILTER, 0, &prog) == -1)
-        errExit("seccomp-install-filter-2");
 }
 
 /* Handler for the SIGINT signal in the target process */
@@ -293,9 +242,6 @@ targetProcess(int sockPair[2], char *argv[], struct cmdLineOpts *opts)
         errExit("prctl");
 
     notifyFd = installNotifyFilter();
-
-    if (opts->secondFilter != -1)
-        installFilter2(opts);
 
     /* Pass the notification file descriptor to the tracing process over
        a UNIX domain socket */
@@ -574,9 +520,6 @@ usageError(char *msg, char *pname)
     fprintf(stderr, "Usage: %s [options] TARGET_PROGRAM [ARGS ...]\n", pname);
     fpe("Options\n");
     fpe("-d <nsecs>    Tracer delays 'nsecs' before inspecting target\n");
-    fpe("-f <val>      Install second filter whose return value is:\n");
-    fpe("              'e' - SECCOMP_RET_ERRNO\n");
-    fpe("              't' - SECCOMP_RET_TRACE\n");
     fpe("-K            Don't kill tracer on termination of target process\n");
     exit(EXIT_FAILURE);
 }
@@ -588,24 +531,14 @@ parseCommandLineOptions(int argc, char *argv[], struct cmdLineOpts *opts)
 {
     int opt;
 
-    opts->secondFilter = -1;
     opts->delaySecs = 0;
     opts->killTracer = true;
 
-    while ((opt = getopt(argc, argv, "d:Kf:")) != -1) {
+    while ((opt = getopt(argc, argv, "d:K")) != -1) {
         switch (opt) {
 
         case 'K':       /* Don't kill tracer when target process terminates */
             opts->killTracer = false;
-            break;
-
-        case 'f':       /* Install a second BPF filter */
-            if (optarg[0] == 'e')
-                opts->secondFilter = SECCOMP_RET_ERRNO;
-            else if (optarg[0] == 't')
-                opts->secondFilter = SECCOMP_RET_TRACE;
-            else
-                usageError("Bad value for -f", argv[0]);
             break;
 
         case 'd':       /* Delay time before sending notification response */
