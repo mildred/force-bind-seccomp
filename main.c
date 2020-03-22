@@ -117,7 +117,6 @@ seccomp(unsigned int operation, unsigned int flags, void *args)
 
 struct cmdLineOpts {
     int  delaySecs;     /* Delay time for responding to notifications */
-    bool killTracer;    /* Kill tracer when target has died? */
 };
 
 /* The following is the x86-64-specific BPF boilerplate code for checking that
@@ -520,7 +519,6 @@ usageError(char *msg, char *pname)
     fprintf(stderr, "Usage: %s [options] TARGET_PROGRAM [ARGS ...]\n", pname);
     fpe("Options\n");
     fpe("-d <nsecs>    Tracer delays 'nsecs' before inspecting target\n");
-    fpe("-K            Don't kill tracer on termination of target process\n");
     exit(EXIT_FAILURE);
 }
 
@@ -532,14 +530,9 @@ parseCommandLineOptions(int argc, char *argv[], struct cmdLineOpts *opts)
     int opt;
 
     opts->delaySecs = 0;
-    opts->killTracer = true;
 
-    while ((opt = getopt(argc, argv, "d:K")) != -1) {
+    while ((opt = getopt(argc, argv, "d:")) != -1) {
         switch (opt) {
-
-        case 'K':       /* Don't kill tracer when target process terminates */
-            opts->killTracer = false;
-            break;
 
         case 'd':       /* Delay time before sending notification response */
             opts->delaySecs = atoi(optarg);
@@ -600,15 +593,10 @@ main(int argc, char *argv[])
     waitpid(targetPid, NULL, 0);
     printf("Parent: target process has terminated\n");
 
-    /* After the target process has terminated, either kill or wait for
-       the tracer process */
+    /* After the target process has terminated, kill the tracer process */
 
-    if (opts.killTracer) {
-        printf("Parent: killing tracer\n");
-        kill(tracerPid, SIGTERM);
-    } else {
-        waitpid(tracerPid, NULL, 0);
-    }
+    printf("Parent: killing tracer\n");
+    kill(tracerPid, SIGTERM);
 
     exit(EXIT_SUCCESS);
 }
