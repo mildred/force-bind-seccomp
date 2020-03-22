@@ -117,6 +117,7 @@ seccomp(unsigned int operation, unsigned int flags, void *args)
 
 struct cmdLineOpts {
     int  delaySecs;     /* Delay time for responding to notifications */
+    bool debug;
 };
 
 /* The following is the x86-64-specific BPF boilerplate code for checking that
@@ -225,7 +226,7 @@ targetProcess(int sockPair[2], char *argv[], struct cmdLineOpts *opts)
 
     /* Child falls through to here */
 
-    printf("Target process: PID = %ld\n", (long) getpid());
+    if(opts->debug) printf("Target process: PID = %ld\n", (long) getpid());
 
     /* Install a handler for the SIGINT signal */
 
@@ -270,10 +271,10 @@ targetProcess(int sockPair[2], char *argv[], struct cmdLineOpts *opts)
    reused by another process. */
 
 static void
-checkNotificationIdIsValid(int notifyFd, __u64 id, char *tag)
+checkNotificationIdIsValid(int notifyFd, __u64 id, char *tag, struct cmdLineOpts *opts)
 {
     if (ioctl(notifyFd, SECCOMP_IOCTL_NOTIF_ID_VALID, &id) == -1) {
-        fprintf(stderr, "Tracer: notification ID check (%s): "
+        if(opts->debug) fprintf(stderr, "Tracer: notification ID check (%s): "
                 "target has died!!!!!!!!!!!\n", tag);
     }
 }
@@ -318,7 +319,7 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
         if (ioctl(notifyFd, SECCOMP_IOCTL_NOTIF_RECV, req) == -1)
             errExit("Tracer: ioctlSECCOMP_IOCTL_NOTIF_RECV");
 
-        printf("Tracer: got notification for PID %d; ID is %llx\n",
+        if(opts->debug) printf("Tracer: got notification for PID %d; ID is %llx\n",
                 req->pid, req->id);
 
         /* If a delay interval was specified on the command line, then delay
@@ -334,16 +335,16 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                employed by checkNotificationIdIsValid()). */
 
         if (opts->delaySecs > 0) {
-            printf("Tracer: delaying for %d seconds:", opts->delaySecs);
-            checkNotificationIdIsValid(notifyFd, req->id, "pre-delay");
+            if(opts->debug) printf("Tracer: delaying for %d seconds:", opts->delaySecs);
+            checkNotificationIdIsValid(notifyFd, req->id, "pre-delay", opts);
 
             for (int d = opts->delaySecs; d > 0; d--) {
-                printf(" %d", d);
+                if(opts->debug) printf(" %d", d);
                 sleep(1);
             }
-            printf("\n");
+            if(opts->debug) printf("\n");
 
-            checkNotificationIdIsValid(notifyFd, req->id, "post-delay");
+            checkNotificationIdIsValid(notifyFd, req->id, "post-delay", opts);
         }
 
         /* Access the memory of the target process in order to discover
@@ -357,7 +358,7 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
 
         /* Check that the process whose info we are accessing is still alive */
 
-        checkNotificationIdIsValid(notifyFd, req->id, "post-open");
+        checkNotificationIdIsValid(notifyFd, req->id, "post-open", opts);
 
         /* Since, the SECCOMP_IOCTL_NOTIF_ID_VALID operation (performed in
            checkNotificationIdIsValid()) succeeded, we know that the
@@ -369,7 +370,7 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
            with flags to ensure that the tracer is not killed if the target
            dies; and (3) killing the target process during the sleep(). */
 
-        // printf("About to sleep in target\n");
+        // if(opts->debug) printf("About to sleep in target\n");
         // sleep(15);
 
         /* Seek to the location containing the pathname argument (i.e., the
@@ -378,7 +379,7 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
         int socketfd = req->data.args[0];
         intptr_t addrptr = req->data.args[1];
         size_t addrlen = req->data.args[2];
-        printf("Tracer: bind(%d, 0x%llx, %lld, %lld, %lld, %llx)\n", socketfd, addrptr, addrlen, req->data.args[3], req->data.args[4], req->data.args[5]);
+        if(opts->debug) printf("Tracer: bind(%d, 0x%llx, %lld, %lld, %lld, %llx)\n", socketfd, addrptr, addrlen, req->data.args[3], req->data.args[4], req->data.args[5]);
 
         if (lseek(procMem, addrptr, SEEK_SET) == -1)
             errExit("Tracer: lseek");
@@ -391,18 +392,20 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
         if (s == -1)
             errExit("read");
         else if (s == 0) {
-            fprintf(stderr, "Tracer: read returned EOF\n");
+            if(opts->debug) fprintf(stderr, "Tracer: read returned EOF\n");
             exit(EXIT_FAILURE);
         }
 
-        for(int i = 0; i < addrlen; ++i) {
-            if(i == 0) printf("Tracer bind addr:");
-            printf(" %02x", ((char*) addr)[i]);
-            if(i == addrlen - 1) printf("\n");
+        if(opts->debug) {
+            for(int i = 0; i < addrlen; ++i) {
+                if(i == 0) printf("Tracer bind addr:");
+                printf(" %02x", ((char*) addr)[i]);
+                if(i == addrlen - 1) printf("\n");
+            }
         }
 
         char addrstring[PATH_MAX];
-        printf("Tracer: bind(%d, %s)\n", socketfd, get_ip_str(addr, addrstring, PATH_MAX));
+        if(opts->debug) printf("Tracer: bind(%d, %s)\n", socketfd, get_ip_str(addr, addrstring, PATH_MAX));
 
         /* The response to the notification includes the notification ID */
 
@@ -436,7 +439,7 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
 
             resp->error = bind(sock, addr, addrlen);
 
-            printf("Tracer: bind() = %d", resp->error);
+            if(opts->debug) printf("Tracer: bind() = %d", resp->error);
             */
 
             resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
@@ -448,7 +451,7 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
             if (s == -1)
                 errExit("read");
             else if (s != addrlen) {
-                fprintf(stderr, "Tracer: short write\n");
+                if(opts->debug) fprintf(stderr, "Tracer: short write\n");
                 exit(EXIT_FAILURE);
             }
 
@@ -460,11 +463,12 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
         /* Provide a response to the target process */
 
         if (ioctl(notifyFd, SECCOMP_IOCTL_NOTIF_SEND, resp) == -1) {
-            if (errno == ENOENT)
-                printf("Tracer: response failed with ENOENT; perhaps target "
+            if (errno == ENOENT) {
+                if(opts->debug) printf("Tracer: response failed with ENOENT; perhaps target "
                         "process's syscall was interrupted by signal?\n");
-            else
+            } else {
                 perror("ioctl-SECCOMP_IOCTL_NOTIF_SEND");
+            }
         }
     }
 }
@@ -490,7 +494,7 @@ tracerProcess(int sockPair[2], struct cmdLineOpts *opts)
 
     /* Child falls through to here */
 
-    printf("Tracer: PID = %ld\n", (long) getpid());
+    if(opts->debug) printf("Tracer: PID = %ld\n", (long) getpid());
 
     /* Receive the notification file descriptor from the target process */
 
@@ -519,6 +523,7 @@ usageError(char *msg, char *pname)
     fprintf(stderr, "Usage: %s [options] TARGET_PROGRAM [ARGS ...]\n", pname);
     fpe("Options\n");
     fpe("-d <nsecs>    Tracer delays 'nsecs' before inspecting target\n");
+    fpe("-D            Debug messages\n");
     exit(EXIT_FAILURE);
 }
 
@@ -530,12 +535,17 @@ parseCommandLineOptions(int argc, char *argv[], struct cmdLineOpts *opts)
     int opt;
 
     opts->delaySecs = 0;
+    opts->debug = false;
 
-    while ((opt = getopt(argc, argv, "d:")) != -1) {
+    while ((opt = getopt(argc, argv, "d:D")) != -1) {
         switch (opt) {
 
         case 'd':       /* Delay time before sending notification response */
             opts->delaySecs = atoi(optarg);
+            break;
+
+        case 'D':
+            opts->debug = true;
             break;
 
         default:
@@ -591,11 +601,11 @@ main(int argc, char *argv[])
     /* Wait for the target process to terminate */
 
     waitpid(targetPid, NULL, 0);
-    printf("Parent: target process has terminated\n");
+    if(opts.debug) printf("Parent: target process has terminated\n");
 
     /* After the target process has terminated, kill the tracer process */
 
-    printf("Parent: killing tracer\n");
+    if(opts.debug) printf("Parent: killing tracer\n");
     kill(tracerPid, SIGTERM);
 
     exit(EXIT_SUCCESS);
