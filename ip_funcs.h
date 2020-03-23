@@ -8,6 +8,11 @@ get_ip_str(const struct sockaddr *sa, char *s, size_t maxlen)
 #define sa6 ((struct sockaddr_in6 *)sa)
     char addr[1024];
 
+    if(!sa) {
+        strncpy(s, "(null)", maxlen);
+        return s;
+    }
+
     switch(sa->sa_family) {
         case AF_INET: {
             inet_ntop(AF_INET, &(sa4->sin_addr), addr, sizeof(addr));

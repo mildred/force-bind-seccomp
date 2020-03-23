@@ -5,6 +5,8 @@ ifneq ($(debug),)
 CFLAGS += -g -O0
 endif
 
+CFLAGS += -DVERSION='"$(shell git describe --always --tags --dirty)"'
+
 force-bind: main.c scm_functions.c *.h
 	cc $(CFLAGS) -o $@ $(filter %.c,$+)
 

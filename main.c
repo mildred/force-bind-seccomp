@@ -89,7 +89,6 @@
 #define errExit(msg)    do { perror(msg); exit(EXIT_FAILURE); \
                         } while (0)
 
-
 static int
 seccomp(unsigned int operation, unsigned int flags, void *args)
 {
@@ -115,7 +114,7 @@ struct cmdLineOpts {
     struct mapping *map;
 };
 
-static bool matchAllAddr(const struct mapping *map, struct sockaddr *sa, const struct cmdLineOpts *opts);
+static int matchAllAddr(const struct mapping *map, struct sockaddr *sa, const struct cmdLineOpts *opts);
 
 /* The following is the x86-64-specific BPF boilerplate code for checking that
    the BPF program is running on the right architecture + ABI. At completion
@@ -448,7 +447,11 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                 errExit("Tracer: malloc");
             memcpy(replacement, addr, addrlen);
 
-            if(matchAllAddr(opts->map, replacement, opts)) {
+            int matchres = matchAllAddr(opts->map, replacement, opts);
+            if(matchres < 0) {
+                resp->flags = 0;
+                resp->error = -matchres;
+            } else if(matchres) {
                 char repladdrstring[PATH_MAX];
                 if(!opts->quiet) printf("force-bind: replace %s with %s\n",
                         get_ip_str(addr, addrstring, sizeof(addrstring)),
@@ -571,25 +574,34 @@ copyAddr(struct addrinfo *info) {
 }
 
 static struct mapping*
-parseMap(const char *map0, struct mapping *next) {
+parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool fullmatch) {
+    int err;
     struct mapping *cur = malloc(sizeof(struct mapping));
-    size_t maplen = strlen(map0);
-    char matchaddr[maplen];
+    size_t maplen = map0 ? strlen(map0) : 0;
+    char map[maplen+1];
+    char *matchaddr = NULL;
     char *prefix = NULL;
     char *replace = NULL;
 
-    strncpy(matchaddr, map0, maplen);
+    bzero(cur, sizeof(struct mapping));
+    bzero(map, sizeof(map));
+    if(map0) strncpy(map, map0, maplen);
 
-    char *c = strchr(matchaddr, '/');
-    if (c && *c) {
-        prefix = c+1;
-        *c = 0;
-    }
+    if (map0 && fullmatch){
+        matchaddr = map;
+        char *c = strchr(map, '/');
+        if (c && *c) {
+            prefix = c+1;
+            *c = 0;
+        }
 
-    c = strchr(prefix ? prefix : matchaddr, '=');
-    if (c && *c) {
-        replace = c+1;
-        *c = 0;
+        c = strchr(prefix ? prefix : map, '=');
+        if (c && *c) {
+            replace = c+1;
+            *c = 0;
+        }
+    } else if(map0) {
+        replace = map;
     }
 
     struct addrinfo hints = {
@@ -598,32 +610,40 @@ parseMap(const char *map0, struct mapping *next) {
     };
     struct addrinfo *res;
 
-    int err = getaddrinfo(matchaddr, NULL, &hints, &res);
-    if(err) {
-        fprintf(stderr, "Cannot parse %s: %s", matchaddr, strerror(err));
-        exit(EXIT_FAILURE);
+    if(fullmatch && opts->debug) {
+        printf("parse map %s %s %s\n", matchaddr, prefix, replace);
     }
-    cur->addr = copyAddr(res);
-    freeaddrinfo(res);
 
-    err = getaddrinfo(replace, NULL, &hints, &res);
-    if(err) {
-        fprintf(stderr, "Cannot parse %s: %s", replace, strerror(err));
-        exit(EXIT_FAILURE);
+    if(matchaddr && *matchaddr){
+        err = getaddrinfo(matchaddr, NULL, &hints, &res);
+        if(err) {
+            fprintf(stderr, "Cannot parse %s: %s", matchaddr, strerror(err));
+            exit(EXIT_FAILURE);
+        }
+        cur->addr = copyAddr(res);
+        freeaddrinfo(res);
     }
-    cur->replacement = copyAddr(res);
-    freeaddrinfo(res);
 
-    if(cur->addr->sa_family != cur->replacement->sa_family) {
+    if(replace && *replace){
+        err = getaddrinfo(replace, NULL, &hints, &res);
+        if(err) {
+            fprintf(stderr, "Cannot parse %s: %s", replace, strerror(err));
+            exit(EXIT_FAILURE);
+        }
+        cur->replacement = copyAddr(res);
+        freeaddrinfo(res);
+    }
+
+    if(cur->addr && cur->replacement && cur->addr->sa_family != cur->replacement->sa_family) {
         fprintf(stderr, "Not the same address family on both sides: %s", map0);
         exit(EXIT_FAILURE);
     }
 
     if(prefix) {
         cur->prefix = atoi(prefix);
-    } else if (cur->addr->sa_family == AF_INET) {
+    } else if (cur->addr && cur->addr->sa_family == AF_INET) {
         cur->prefix = 32;
-    } else if (cur->addr->sa_family == AF_INET6) {
+    } else if (cur->addr && cur->addr->sa_family == AF_INET6) {
         cur->prefix = 128;
     }
 
@@ -658,6 +678,7 @@ netAddrIpv6(int prefix, struct in6_addr *addr) {
 
 static bool
 matchAddr(const struct mapping *map, const struct sockaddr *sa, const struct cmdLineOpts *opts) {
+    if(!map->addr) return true;
     if (sa->sa_family != map->addr->sa_family) return false;
 
     switch(sa->sa_family) {
@@ -720,7 +741,7 @@ setReplacement(struct sockaddr *addr0, const struct sockaddr *repl0) {
             struct sockaddr_in6 *addr = (struct sockaddr_in6 *) addr0;
             struct sockaddr_in6 *repl = (struct sockaddr_in6 *) repl0;
 
-            memcpy(addr, repl, sizeof(struct sockaddr_in));
+            memcpy(addr, repl, sizeof(struct sockaddr_in6));
 
             if(addr->sin6_port == 0) {
                 addr->sin6_port = sa.sin6_port;
@@ -730,18 +751,27 @@ setReplacement(struct sockaddr *addr0, const struct sockaddr *repl0) {
     }
 }
 
-static bool
+static int
 matchAllAddr(const struct mapping *map, struct sockaddr *sa, const struct cmdLineOpts *opts) {
-    char addr1[PATH_MAX], addr2[PATH_MAX];
+    char addr1[PATH_MAX], addr2[PATH_MAX], addr3[PATH_MAX];
     while(map) {
-        if(opts->verbose) printf("force-bind: match %s with %s/%d\n", get_ip_str(sa, addr1, sizeof(addr1)), get_ip_str(map->addr, addr2, sizeof(addr2)), map->prefix);
+        if(opts->verbose) printf("force-bind: try match %s with %s/%d (replace with %s)\n",
+                get_ip_str(sa, addr1, sizeof(addr1)),
+                get_ip_str(map->addr, addr2, sizeof(addr2)), map->prefix,
+                get_ip_str(map->replacement, addr3, sizeof(addr3)));
         if(matchAddr(map, sa, opts)) {
-            setReplacement(sa, map->replacement);
-            return true;
+            if(map->replacement) {
+                setReplacement(sa, map->replacement);
+                return 1;
+            } else {
+                return -EACCES;
+            }
         }
         map = map->next;
     }
-    return false;
+    if(opts->verbose) printf("force-bind: did not match %s\n",
+            get_ip_str(sa, addr1, sizeof(addr1)));
+    return 0;
 }
 
 /* Diagnose an error in command-line option or argument usage */
@@ -755,16 +785,23 @@ usageError(char *msg, char *pname)
 #define fpe(msg) fprintf(stderr, "      " msg);
     fprintf(stderr, "Usage: %s [options] TARGET_PROGRAM [ARGS ...]\n", pname);
     fpe("Options\n");
+    fpe("-h                Help\n");
+    fpe("-V                Version information\n");
     fpe("-m IP/PREFIX=IP   Replace bind() matching first IP/PREFIX with second IP\n");
-    fpe("-d <nsecs>        Tracer delays 'nsecs' before inspecting target\n");
+    fpe("-b IP             Replace all bind() with IP (if same family)\n");
+    fpe("-d                Deny all bind()\n");
+    fpe("-t <nsecs>        Tracer delays 'nsecs' before inspecting target\n");
     fpe("-D                Debug messages\n");
     fpe("-q                Quiet\n");
-    exit(EXIT_FAILURE);
+    printf("\nLast rules (-m, -b, -d) are applied first.\n");
+#ifdef VERSION
+    printf("\nVersion: %s\n", VERSION);
+#endif
 }
 
 /* Parse command-line options, returning option info in 'opts' */
 
-static void
+static int
 parseCommandLineOptions(int argc, char *argv[], struct cmdLineOpts *opts)
 {
     int opt;
@@ -773,41 +810,61 @@ parseCommandLineOptions(int argc, char *argv[], struct cmdLineOpts *opts)
     opts->debug = false;
     opts->map = NULL;
 
-    while ((opt = getopt(argc, argv, "m:d:Dqv")) != -1) {
-        switch (opt) {
+    int i;
+    for(i = 1; argv[i]; i++){
+        const char *arg = argv[i];
+        if       (!strcmp("-m", arg) && argv[i+1]) { /* Mapping */
+            opts->map = parseMap(argv[++i], opts->map, opts, true);
 
-        case 'm':       /* Mapping */
-            // handle optarg
-            opts->map = parseMap(optarg, opts->map);
-            break;
+        } else if(!strcmp("-b", arg) && argv[i+1]) { /* Bind */
+            opts->map = parseMap(argv[++i], opts->map, opts, false);
 
-        case 'd':       /* Delay time before sending notification response */
-            opts->delaySecs = atoi(optarg);
-            break;
+        } else if(!strcmp("-d", arg)) {              /* Deny */
+            opts->map = parseMap(NULL, opts->map, opts, false);
 
-        case 'D':       /* Debug */
+        } else if(!strcmp("-t", arg) && argv[i+1]) { /* Delay time before sending notification response */
+            opts->delaySecs = atoi(argv[++i]);
+
+        } else if(!strcmp("-D", arg)) {              /* Debug */
             opts->debug = true;
-            break;
 
-        case 'q':       /* Quiet */
+        } else if(!strcmp("-q", arg)) {              /* Quiet */
             opts->quiet = true;
-            break;
 
-        case 'v':       /* Verbose */
+        } else if(!strcmp("-v", arg)) {              /* Verbose */
             opts->verbose = true;
-            break;
 
-        default:
+        } else if(!strcmp("-V", arg)) {              /* Version */
+#ifdef VERSION
+            printf("Version: %s\n", VERSION);
+            exit(EXIT_SUCCESS);
+#else
+            fprintf(stderr, "No version string available\n");
+            exit(EXIT_FAILURE);
+#endif
+
+        } else if(!strcmp("-h", arg)) {              /* Help */
+            usageError(NULL, argv[0]);
+            exit(EXIT_SUCCESS);
+
+        } else if(*arg == '-') {
             usageError("Bad option", argv[0]);
             exit(EXIT_FAILURE);
+
+        } else {
+            break;
         }
     }
 
     /* There should be at least one command-line argument after the options */
 
-    if (optind >= argc)
+    if (!argv[i]) {
         usageError("At least one pathname argument should be supplied",
                 argv[0]);
+        exit(EXIT_FAILURE);
+    }
+
+    return i;
 }
 
 int
@@ -819,7 +876,7 @@ main(int argc, char *argv[])
 
     setbuf(stdout, NULL);
 
-    parseCommandLineOptions(argc, argv, &opts);
+    int optind = parseCommandLineOptions(argc, argv, &opts);
 
     /* Create a UNIX domain socket that is used to pass the seccomp
        notification file descriptor from the target process to the tracer
