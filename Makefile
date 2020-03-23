@@ -1,11 +1,15 @@
 all: force-bind target-mkdir target-bind
 .PHONY: all
 
-force-bind: main.c scm_functions.c
-	cc -o $@ $+
+ifneq ($(debug),)
+CFLAGS += -g -O0
+endif
 
-target-mkdir: target_mkdir.c
-	cc -o $@ $+
+force-bind: main.c scm_functions.c *.h
+	cc $(CFLAGS) -o $@ $(filter %.c,$+)
 
-target-bind: target_bind.c
-	cc -o $@ $+
+target-mkdir: target_mkdir.c *.h
+	cc $(CFLAGS) -o $@ $(filter %.c,$+)
+
+target-bind: target_bind.c *.h
+	cc $(CFLAGS) -o $@ $(filter %.c,$+)

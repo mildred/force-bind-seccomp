@@ -5,11 +5,14 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <netdb.h>
+#include <arpa/inet.h>
+
+#include "ip_funcs.h"
 
 #define BUF_SIZE 500
 
-
 int main(int argc, char *argv[]) {
+   char addrstr[1024];
    struct addrinfo hints;
    struct addrinfo *result, *rp;
    int sfd, s;
@@ -51,8 +54,12 @@ int main(int argc, char *argv[]) {
            continue;
 
        printf("bind(%d, %p, %d)\n", sfd, (void*) rp->ai_addr, rp->ai_addrlen);
-       if (bind(sfd, rp->ai_addr, rp->ai_addrlen) == 0)
+       printf("(before) %p = %s\n", rp->ai_addr, get_ip_str(rp->ai_addr, addrstr, sizeof(addrstr)));
+       if (bind(sfd, rp->ai_addr, rp->ai_addrlen) == 0) {
+           printf("(after)  %p = %s\n", rp->ai_addr, get_ip_str(rp->ai_addr, addrstr, sizeof(addrstr)));
            break;                  /* Success */
+       }
+       printf("(after)  %p = %s\n", rp->ai_addr, get_ip_str(rp->ai_addr, addrstr, sizeof(addrstr)));
 
        close(sfd);
    }
@@ -67,6 +74,7 @@ int main(int argc, char *argv[]) {
    /* Read datagrams and echo them back to sender */
 
    for (;;) {
+       printf("recvfrom(%d, %p, %d, ...)\n", sfd, buf, BUF_SIZE);
        peer_addr_len = sizeof(struct sockaddr_storage);
        nread = recvfrom(sfd, buf, BUF_SIZE, 0,
                (struct sockaddr *) &peer_addr, &peer_addr_len);

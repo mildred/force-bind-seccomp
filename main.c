@@ -81,31 +81,14 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include "scm_functions.h"
+
+#include "ip_funcs.h"
 
 #define errExit(msg)    do { perror(msg); exit(EXIT_FAILURE); \
                         } while (0)
 
-static char *
-get_ip_str(const struct sockaddr *sa, char *s, size_t maxlen)
-{
-    switch(sa->sa_family) {
-        case AF_INET:
-            inet_ntop(AF_INET, &(((struct sockaddr_in *)sa)->sin_addr),
-                    s, maxlen);
-            break;
-
-        case AF_INET6:
-            inet_ntop(AF_INET6, &(((struct sockaddr_in6 *)sa)->sin6_addr),
-                    s, maxlen);
-            break;
-
-        default:
-            return NULL;
-    }
-
-    return s;
-}
 
 static int
 seccomp(unsigned int operation, unsigned int flags, void *args)
@@ -115,10 +98,24 @@ seccomp(unsigned int operation, unsigned int flags, void *args)
 
 /* Values from command-line options */
 
+struct mapping;
+
+struct mapping {
+    struct sockaddr *addr;
+    int prefix;
+    struct sockaddr *replacement;
+    struct mapping *next;
+};
+
 struct cmdLineOpts {
     int  delaySecs;     /* Delay time for responding to notifications */
     bool debug;
+    bool quiet;
+    bool verbose;
+    struct mapping *map;
 };
+
+static bool matchAllAddr(const struct mapping *map, struct sockaddr *sa, const struct cmdLineOpts *opts);
 
 /* The following is the x86-64-specific BPF boilerplate code for checking that
    the BPF program is running on the right architecture + ABI. At completion
@@ -396,7 +393,10 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
             exit(EXIT_FAILURE);
         }
 
+        char addrstring[PATH_MAX];
         if(opts->debug) {
+            printf("Tracer: %p = %s\n", (void*) addrptr,
+                    get_ip_str(addr, addrstring, sizeof(addrstring)));
             for(int i = 0; i < addrlen; ++i) {
                 if(i == 0) printf("Tracer bind addr:");
                 printf(" %02x", ((char*) addr)[i]);
@@ -404,8 +404,7 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
             }
         }
 
-        char addrstring[PATH_MAX];
-        if(opts->debug) printf("Tracer: bind(%d, %s)\n", socketfd, get_ip_str(addr, addrstring, PATH_MAX));
+        if(opts->debug) printf("Tracer: bind(%d, %s)\n", socketfd, get_ip_str(addr, addrstring, sizeof(addrstring)));
 
         /* The response to the notification includes the notification ID */
 
@@ -444,18 +443,70 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
 
             resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
 
-            if (lseek(procMem, addrptr, SEEK_SET) == -1)
-                errExit("Tracer: lseek");
+            struct sockaddr *replacement = malloc(addrlen);
+            if (replacement == NULL)
+                errExit("Tracer: malloc");
+            memcpy(replacement, addr, addrlen);
 
-            ssize_t s = write(procMem, addr, addrlen);
-            if (s == -1)
-                errExit("read");
-            else if (s != addrlen) {
-                if(opts->debug) fprintf(stderr, "Tracer: short write\n");
-                exit(EXIT_FAILURE);
+            if(matchAllAddr(opts->map, replacement, opts)) {
+                char repladdrstring[PATH_MAX];
+                if(!opts->quiet) printf("force-bind: replace %s with %s\n",
+                        get_ip_str(addr, addrstring, sizeof(addrstring)),
+                        get_ip_str(replacement, repladdrstring, sizeof(repladdrstring)));
+
+                if (lseek(procMem, addrptr, SEEK_SET) == -1)
+                    errExit("force-bind: lseek");
+
+                if(opts->debug) {
+                    for(int i = 0; i < addrlen; ++i) {
+                        if(i == 0) printf("Tracer write addr:");
+                        printf(" %02x", ((char*) replacement)[i]);
+                        if(i == addrlen - 1) printf("\n");
+                    }
+                }
+
+                ssize_t s = write(procMem, replacement, addrlen);
+                if (s == -1)
+                    errExit("read");
+                else if (s != addrlen) {
+                    fprintf(stderr, "force-bind: short write\n");
+                    exit(EXIT_FAILURE);
+                }
+
+                if(opts->debug) {
+
+                    if (lseek(procMem, addrptr, SEEK_SET) == -1)
+                        errExit("Tracer: lseek");
+
+                    free(addr);
+                    addr = malloc(addrlen);
+                    if (resp == NULL)
+                        errExit("Tracer: malloc");
+
+                    ssize_t s = read(procMem, addr, addrlen);
+                    if (s == -1)
+                        errExit("read");
+                    else if (s == 0) {
+                        if(opts->debug) fprintf(stderr, "Tracer: read returned EOF\n");
+                        exit(EXIT_FAILURE);
+                    }
+
+                    printf("Tracer: %p = %s\n", (void*) addrptr,
+                            get_ip_str(addr, addrstring, sizeof(addrstring)));
+
+                    for(int i = 0; i < addrlen; ++i) {
+                        if(i == 0) printf("Tracer bind addr:");
+                        printf(" %02x", ((char*) addr)[i]);
+                        if(i == addrlen - 1) printf("\n");
+                    }
+                }
+
+                free(replacement);
             }
 
         }
+
+        free(addr);
 
         if (close(procMem) == -1)
             errExit("close-/proc/PID/mem");
@@ -470,6 +521,7 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                 perror("ioctl-SECCOMP_IOCTL_NOTIF_SEND");
             }
         }
+        if(opts->debug) printf("Tracer: notification sent.\n");
     }
 }
 
@@ -511,6 +563,187 @@ tracerProcess(int sockPair[2], struct cmdLineOpts *opts)
     exit(EXIT_SUCCESS);         /* NOTREACHED */
 }
 
+static struct sockaddr *
+copyAddr(struct addrinfo *info) {
+    struct sockaddr *res = malloc(info->ai_addrlen);
+    memcpy(res, info->ai_addr, info->ai_addrlen);
+    return res;
+}
+
+static struct mapping*
+parseMap(const char *map0, struct mapping *next) {
+    struct mapping *cur = malloc(sizeof(struct mapping));
+    size_t maplen = strlen(map0);
+    char matchaddr[maplen];
+    char *prefix = NULL;
+    char *replace = NULL;
+
+    strncpy(matchaddr, map0, maplen);
+
+    char *c = strchr(matchaddr, '/');
+    if (c && *c) {
+        prefix = c+1;
+        *c = 0;
+    }
+
+    c = strchr(prefix ? prefix : matchaddr, '=');
+    if (c && *c) {
+        replace = c+1;
+        *c = 0;
+    }
+
+    struct addrinfo hints = {
+        .ai_flags = AI_PASSIVE,
+        .ai_family = AF_UNSPEC
+    };
+    struct addrinfo *res;
+
+    int err = getaddrinfo(matchaddr, NULL, &hints, &res);
+    if(err) {
+        fprintf(stderr, "Cannot parse %s: %s", matchaddr, strerror(err));
+        exit(EXIT_FAILURE);
+    }
+    cur->addr = copyAddr(res);
+    freeaddrinfo(res);
+
+    err = getaddrinfo(replace, NULL, &hints, &res);
+    if(err) {
+        fprintf(stderr, "Cannot parse %s: %s", replace, strerror(err));
+        exit(EXIT_FAILURE);
+    }
+    cur->replacement = copyAddr(res);
+    freeaddrinfo(res);
+
+    if(cur->addr->sa_family != cur->replacement->sa_family) {
+        fprintf(stderr, "Not the same address family on both sides: %s", map0);
+        exit(EXIT_FAILURE);
+    }
+
+    if(prefix) {
+        cur->prefix = atoi(prefix);
+    } else if (cur->addr->sa_family == AF_INET) {
+        cur->prefix = 32;
+    } else if (cur->addr->sa_family == AF_INET6) {
+        cur->prefix = 128;
+    }
+
+    cur->next = next;
+    return cur;
+}
+
+static struct in_addr
+netAddrIpv4(int prefix, struct in_addr *addr) {
+    in_addr_t netmask = 0;
+    while(prefix--){
+        netmask = (netmask << 1) | 1;
+    }
+    struct in_addr res = { .s_addr = netmask & addr->s_addr };
+    return res;
+}
+
+static struct in6_addr
+netAddrIpv6(int prefix, struct in6_addr *addr) {
+    struct in6_addr netmask;
+    for (long i = prefix, j = 0; i > 0; i -= 8, ++j) {
+        netmask.s6_addr[j] = (i >= 8) ?
+            0xff :
+            ( 0xffU << ( 8 - i ) ) & 0xffU;
+    }
+    struct in6_addr res = {};
+    for(int i = 0; i < 16; i++) {
+        res.s6_addr[i] = res.s6_addr[i] & netmask.s6_addr[i];
+    }
+    return netmask;
+}
+
+static bool
+matchAddr(const struct mapping *map, const struct sockaddr *sa, const struct cmdLineOpts *opts) {
+    if (sa->sa_family != map->addr->sa_family) return false;
+
+    switch(sa->sa_family) {
+        case AF_INET: {
+            struct sockaddr_in *addr = (struct sockaddr_in *) sa;
+            struct sockaddr_in *map_addr = (struct sockaddr_in *) map->addr;
+
+            /* check port number */
+            if (map_addr->sin_port != 0 && map_addr->sin_port != addr->sin_port) return false;
+
+            /* check network IP */
+            struct in_addr net_addr = netAddrIpv4(map->prefix, &addr->sin_addr);
+            struct in_addr map_net_addr = netAddrIpv4(map->prefix, &map_addr->sin_addr);
+            if (net_addr.s_addr != map_net_addr.s_addr) return false;
+
+            break;
+        }
+
+        case AF_INET6: {
+            struct sockaddr_in6 *addr = (struct sockaddr_in6 *) sa;
+            struct sockaddr_in6 *map_addr = (struct sockaddr_in6 *) map->addr;
+
+            /* check port number */
+            if (map_addr->sin6_port != 0 && map_addr->sin6_port != addr->sin6_port) return false;
+
+            /* check network IP */
+            struct in6_addr net_addr = netAddrIpv6(map->prefix, &addr->sin6_addr);
+            struct in6_addr map_net_addr = netAddrIpv6(map->prefix, &map_addr->sin6_addr);
+            for(int i = 0; i < 16; ++i)
+                if (net_addr.s6_addr[i] != map_net_addr.s6_addr[i]) return false;
+
+            break;
+        }
+
+        default:
+            return false;
+    }
+
+    return true;
+}
+
+static void
+setReplacement(struct sockaddr *addr0, const struct sockaddr *repl0) {
+    switch(addr0->sa_family) {
+        case AF_INET: {
+            struct sockaddr_in sa = *((struct sockaddr_in *) addr0);
+            struct sockaddr_in *addr = (struct sockaddr_in *) addr0;
+            struct sockaddr_in *repl = (struct sockaddr_in *) repl0;
+
+            memcpy(addr, repl, sizeof(struct sockaddr_in));
+
+            if(addr->sin_port == 0) {
+                addr->sin_port = sa.sin_port;
+            }
+            break;
+        }
+
+        case AF_INET6: {
+            struct sockaddr_in6 sa = *((struct sockaddr_in6 *) addr0);
+            struct sockaddr_in6 *addr = (struct sockaddr_in6 *) addr0;
+            struct sockaddr_in6 *repl = (struct sockaddr_in6 *) repl0;
+
+            memcpy(addr, repl, sizeof(struct sockaddr_in));
+
+            if(addr->sin6_port == 0) {
+                addr->sin6_port = sa.sin6_port;
+            }
+            break;
+        }
+    }
+}
+
+static bool
+matchAllAddr(const struct mapping *map, struct sockaddr *sa, const struct cmdLineOpts *opts) {
+    char addr1[PATH_MAX], addr2[PATH_MAX];
+    while(map) {
+        if(opts->verbose) printf("force-bind: match %s with %s/%d\n", get_ip_str(sa, addr1, sizeof(addr1)), get_ip_str(map->addr, addr2, sizeof(addr2)), map->prefix);
+        if(matchAddr(map, sa, opts)) {
+            setReplacement(sa, map->replacement);
+            return true;
+        }
+        map = map->next;
+    }
+    return false;
+}
+
 /* Diagnose an error in command-line option or argument usage */
 
 static void
@@ -522,8 +755,10 @@ usageError(char *msg, char *pname)
 #define fpe(msg) fprintf(stderr, "      " msg);
     fprintf(stderr, "Usage: %s [options] TARGET_PROGRAM [ARGS ...]\n", pname);
     fpe("Options\n");
-    fpe("-d <nsecs>    Tracer delays 'nsecs' before inspecting target\n");
-    fpe("-D            Debug messages\n");
+    fpe("-m IP/PREFIX=IP   Replace bind() matching first IP/PREFIX with second IP\n");
+    fpe("-d <nsecs>        Tracer delays 'nsecs' before inspecting target\n");
+    fpe("-D                Debug messages\n");
+    fpe("-q                Quiet\n");
     exit(EXIT_FAILURE);
 }
 
@@ -536,16 +771,30 @@ parseCommandLineOptions(int argc, char *argv[], struct cmdLineOpts *opts)
 
     opts->delaySecs = 0;
     opts->debug = false;
+    opts->map = NULL;
 
-    while ((opt = getopt(argc, argv, "d:D")) != -1) {
+    while ((opt = getopt(argc, argv, "m:d:Dqv")) != -1) {
         switch (opt) {
+
+        case 'm':       /* Mapping */
+            // handle optarg
+            opts->map = parseMap(optarg, opts->map);
+            break;
 
         case 'd':       /* Delay time before sending notification response */
             opts->delaySecs = atoi(optarg);
             break;
 
-        case 'D':
+        case 'D':       /* Debug */
             opts->debug = true;
+            break;
+
+        case 'q':       /* Quiet */
+            opts->quiet = true;
+            break;
+
+        case 'v':       /* Verbose */
+            opts->verbose = true;
             break;
 
         default:
