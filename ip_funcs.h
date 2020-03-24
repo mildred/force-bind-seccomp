@@ -1,6 +1,40 @@
 #ifndef _FORCE_BIND_SECCOMP_IP_FUNCS_H_
 #define _FORCE_BIND_SECCOMP_IP_FUNCS_H_
 
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+
+
+static int getaddrinfo2(const char *nodeport0,
+                       const struct addrinfo *hints,
+                       struct addrinfo **res) {
+    size_t len = strlen(nodeport0);
+    char nodeport[len+1];
+    strncpy(nodeport, nodeport0, len);
+
+    char *node = nodeport, *service = nodeport;
+
+    if(*nodeport == '['){
+        char *c = strchr(nodeport, ']');
+        if(c && *c) {
+            *c = 0;
+            node = nodeport + 1;
+            service = c + 1;
+        }
+    }
+
+    char *c = strchr(service, ':');
+    if(c && *c) {
+        *c = 0;
+        service = c+1;
+    } else {
+        service = NULL;
+    }
+
+    return getaddrinfo(node, service, hints, res);
+}
+
 static char *
 get_ip_str(const struct sockaddr *sa, char *s, size_t maxlen)
 {

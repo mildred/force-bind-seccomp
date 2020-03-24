@@ -615,9 +615,9 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
     }
 
     if(matchaddr && *matchaddr){
-        err = getaddrinfo(matchaddr, NULL, &hints, &res);
+        err = getaddrinfo2(matchaddr, &hints, &res);
         if(err) {
-            fprintf(stderr, "Cannot parse %s: %s", matchaddr, strerror(err));
+            fprintf(stderr, "Cannot parse %s: %s\n", matchaddr, strerror(err));
             exit(EXIT_FAILURE);
         }
         cur->addr = copyAddr(res);
@@ -625,9 +625,9 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
     }
 
     if(replace && *replace){
-        err = getaddrinfo(replace, NULL, &hints, &res);
+        err = getaddrinfo2(replace, &hints, &res);
         if(err) {
-            fprintf(stderr, "Cannot parse %s: %s", replace, strerror(err));
+            fprintf(stderr, "Cannot parse %s: %s\n", replace, strerror(err));
             exit(EXIT_FAILURE);
         }
         cur->replacement = copyAddr(res);
@@ -678,7 +678,8 @@ netAddrIpv6(int prefix, struct in6_addr *addr) {
 
 static bool
 matchAddr(const struct mapping *map, const struct sockaddr *sa, const struct cmdLineOpts *opts) {
-    if(!map->addr) return true;
+    if (map->replacement && sa->sa_family != map->replacement->sa_family) return false;
+    if (!map->addr) return true;
     if (sa->sa_family != map->addr->sa_family) return false;
 
     switch(sa->sa_family) {
