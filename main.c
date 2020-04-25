@@ -688,6 +688,7 @@ matchAddr(const struct mapping *map, const struct sockaddr *sa, const struct cmd
             struct sockaddr_in *map_addr = (struct sockaddr_in *) map->addr;
 
             /* check port number */
+            if (addr->sin_port == 0) return false; // Never match outgoing connections
             if (map_addr->sin_port != 0 && map_addr->sin_port != addr->sin_port) return false;
 
             /* check network IP */
@@ -703,6 +704,7 @@ matchAddr(const struct mapping *map, const struct sockaddr *sa, const struct cmd
             struct sockaddr_in6 *map_addr = (struct sockaddr_in6 *) map->addr;
 
             /* check port number */
+            if (addr->sin6_port == 0) return false; // Never match outgoing connections
             if (map_addr->sin6_port != 0 && map_addr->sin6_port != addr->sin6_port) return false;
 
             /* check network IP */
@@ -754,6 +756,17 @@ setReplacement(struct sockaddr *addr0, const struct sockaddr *repl0) {
 
 static int
 matchAllAddr(const struct mapping *map, struct sockaddr *sa, const struct cmdLineOpts *opts) {
+    switch(sa->sa_family) {
+        case AF_INET: {
+            struct sockaddr_in *addr = (struct sockaddr_in *) sa;
+            if (addr->sin_port == 0) return 0; // Never match outgoing connections
+        }
+        case AF_INET6: {
+            struct sockaddr_in6 *addr = (struct sockaddr_in6 *) sa;
+            if (addr->sin6_port == 0) return 0; // Never match outgoing connections
+        }
+    }
+
     char addr1[PATH_MAX], addr2[PATH_MAX], addr3[PATH_MAX];
     while(map) {
         if(opts->verbose) printf("force-bind: try match %s with %s/%d (replace with %s)\n",
@@ -786,14 +799,16 @@ usageError(char *msg, char *pname)
 #define fpe(msg) fprintf(stderr, "      " msg);
     fprintf(stderr, "Usage: %s [options] TARGET_PROGRAM [ARGS ...]\n", pname);
     fpe("Options\n");
-    fpe("-h                Help\n");
-    fpe("-V                Version information\n");
-    fpe("-m IP/PREFIX=IP   Replace bind() matching first IP/PREFIX with second IP\n");
-    fpe("-b IP             Replace all bind() with IP (if same family)\n");
-    fpe("-d                Deny all bind()\n");
-    fpe("-t <nsecs>        Tracer delays 'nsecs' before inspecting target\n");
-    fpe("-D                Debug messages\n");
-    fpe("-q                Quiet\n");
+    fpe("-h                    Help\n");
+    fpe("-V                    Version information\n");
+    fpe("-m ADDR/PREFIX=ADDR   Replace bind() matching first ADDR/PREFIX with\n"
+        "                      second ADDR (ADDR is IP:PORT)\n");
+    fpe("-b ADDR               Replace all bind() with ADDR (if same family)\n");
+    fpe("-d                    Deny all bind()\n");
+    fpe("-t <nsecs>            Tracer delays 'nsecs' before inspecting target\n");
+    fpe("-D                    Debug messages\n");
+    fpe("-v                    Verbose\n");
+    fpe("-q                    Quiet\n");
     printf("\nLast rules (-m, -b, -d) are applied first.\n");
 #ifdef VERSION
     printf("\nVersion: %s\n", VERSION);
