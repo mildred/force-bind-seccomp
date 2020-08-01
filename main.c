@@ -64,6 +64,8 @@
 #include <sys/types.h>
 #include <sys/ptrace.h>
 #include <sys/prctl.h>
+#include <sys/reg.h>
+#include <sys/user.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
@@ -109,7 +111,6 @@ struct mapping {
 };
 
 struct cmdLineOpts {
-    int  delaySecs;     /* Delay time for responding to notifications */
     bool require_ptrace;
     bool debug;
     bool quiet;
@@ -117,7 +118,7 @@ struct cmdLineOpts {
     struct mapping *map;
 };
 
-static int matchAllAddr(const struct mapping *map, struct sockaddr *sa, const struct cmdLineOpts *opts);
+static int matchAllAddr(const struct mapping *map, struct sockaddr *sa, int *newfd, const struct cmdLineOpts *opts);
 
 /* The following is the x86-64-specific BPF boilerplate code for checking that
    the BPF program is running on the right architecture + ABI. At completion
@@ -364,31 +365,6 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
         if(opts->debug) printf("Tracer: got notification for PID %d; ID is %llx\n",
                 req->pid, req->id);
 
-        /* If a delay interval was specified on the command line, then delay
-           for the specified number of seconds. This can be used to demonstrate
-           the following:
-
-           (1) The target process is blocked until the tracer sends a response.
-           (2) If the blocked system call is interrupted by a signal handler,
-               then the SECCOMP_IOCTL_NOTIF_SEND operation fails with the error
-               ENOENT.
-           (3) If the target process terminates, then we can discover this
-               using the SECCOMP_IOCTL_NOTIF_ID_VALID operation (which is
-               employed by checkNotificationIdIsValid()). */
-
-        if (opts->delaySecs > 0) {
-            if(opts->debug) printf("Tracer: delaying for %d seconds:", opts->delaySecs);
-            checkNotificationIdIsValid(notifyFd, req->id, "pre-delay", opts);
-
-            for (int d = opts->delaySecs; d > 0; d--) {
-                if(opts->debug) printf(" %d", d);
-                sleep(1);
-            }
-            if(opts->debug) printf("\n");
-
-            checkNotificationIdIsValid(notifyFd, req->id, "post-delay", opts);
-        }
-
         /* Access the memory of the target process in order to discover
            the syscall arguments */
 
@@ -493,10 +469,14 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
                 errExit("Tracer: malloc");
             memcpy(replacement, addr, addrlen);
 
-            int matchres = matchAllAddr(opts->map, replacement, opts);
+            int newfd;
+            int matchres = matchAllAddr(opts->map, replacement, &newfd, opts);
             if(matchres < 0) {
                 resp->flags = 0;
                 resp->error = -matchres;
+            } else if(matchres == 2) {
+                resp->flags = 0;
+                resp->error = -EINVAL;
             } else if(matchres == 1) {
                 char repladdrstring[PATH_MAX];
                 if(!opts->quiet) printf("force-bind: replace %s with %s\n",
@@ -630,6 +610,76 @@ wait_for_ptrace(pid_t target, struct cmdLineOpts *opts){
     }
 }
 
+static void ptrace_read_bind_args(pid_t target, struct user_regs_struct *regs, int *sockfd, struct sockaddr** addr, socklen_t *addrlen, bool debug) {
+    //*sockfd          = (int)       ptrace(PTRACE_PEEKUSER, target, sizeof(long)*RDI, 0);
+    //intptr_t addrptr = (intptr_t)  ptrace(PTRACE_PEEKUSER, target, sizeof(long)*RSI, 0);
+    //*addrlen         = (socklen_t) ptrace(PTRACE_PEEKUSER, target, sizeof(long)*RDX, 0);
+
+    *sockfd          = (int)       regs->rdi;
+    intptr_t addrptr = (intptr_t)  regs->rsi;
+    *addrlen         = (socklen_t) regs->rdx;
+
+    if (debug) {
+        printf("Tracer: intercept bind(%ld, %p, %ld)\n", *sockfd, (void*) addrptr, *addrlen);
+    }
+
+    // reserve extra space in case the addrlen is not a multiple of sizeof(long)
+    char buffer[*addrlen + sizeof(long)];
+
+    // Get the address from the process memory
+    for (int j = 0; j < *addrlen; j += sizeof(long)) {
+        long word = ptrace(PTRACE_PEEKDATA, target, addrptr + j, NULL);
+        memcpy(&buffer[j], &word, sizeof(long));
+        if (debug) {
+            printf("Tracer: read address 0x%p+0x%02x %08x\n", (void*) addrptr, j, word);
+        }
+    }
+
+    // prepare the address buffer
+    *addr = malloc(*addrlen);
+    if (*addr == NULL)
+        errExit("Tracer: malloc");
+
+    // Copy the address to the buffer
+    memcpy(*addr, buffer, *addrlen);
+}
+
+static bool ptrace_put_bind_args(pid_t target, struct user_regs_struct *regs, int sockfd, struct sockaddr* addr, socklen_t addrlen, bool debug) {
+    int       t_sockfd  = (int)       regs->rdi;
+    intptr_t  addrptr   = (intptr_t)  regs->rsi;
+    socklen_t t_addrlen = (socklen_t) regs->rdx;
+
+    if (t_addrlen < addrlen) {
+        return false;
+    }
+
+    regs->rdi = sockfd;
+    regs->rdx = addrlen;
+
+    const char *buffer = (const char*) addr;
+
+    // Get the address from the process memory
+    for (int j = 0; j < addrlen; j += sizeof(long)) {
+        size_t nextlen = j + sizeof(long);
+        long word = 0;
+        if (nextlen <= addrlen) {
+            // nominal case, there is enough bytes to read buffer and to write
+            // to target
+            word = *((const long*) &buffer[j]);
+        } else if (nextlen > t_addrlen) {
+            // there is not enough room on the target to write a full word
+            word = ptrace(PTRACE_PEEKDATA, target, addrptr + j, NULL);
+            memcpy(&word, &buffer[j], addrlen - j);
+        } else {
+            // there is enough room on the target, but not enough to read
+            // locally
+            memcpy(&word, &buffer[j], addrlen - j);
+        }
+        ptrace(PTRACE_POKEDATA, target, addrptr + j, word);
+    }
+    return true;
+}
+
 static void
 process_ptrace(pid_t target, struct cmdLineOpts *opts) {
     while(1) {
@@ -637,12 +687,72 @@ process_ptrace(pid_t target, struct cmdLineOpts *opts) {
         if (wait_for_ptrace(target, opts) != 0) break;
 
         /* Find out file and re-direct if it is the target */
+        struct user_regs_struct regs;
+        ptrace(PTRACE_GETREGS, target, 0, &regs);
 
-        read_file(child, orig_file);
-        printf("[Opening %s]\n", orig_file);
+        int socketfd;
+        socklen_t addrlen;
+        struct sockaddr *addr;
 
-        if (strcmp(file_to_avoid, orig_file) == 0)
-            redirect_file(child, file_to_redirect);
+        ptrace_read_bind_args(target, &regs, &socketfd, &addr, &addrlen, opts->debug);
+
+        if(opts->debug) {
+            char addrstring[PATH_MAX];
+            printf("Tracer: intercept bind(%d, %s)\n", socketfd, get_ip_str(addr, addrstring, sizeof(addrstring)));
+        }
+
+        if (addr->sa_family != AF_INET && addr->sa_family != AF_INET6) {
+            continue;
+        } else {
+            struct sockaddr *replacement = malloc(addrlen);
+            if (replacement == NULL)
+                errExit("Tracer: malloc");
+            memcpy(replacement, addr, addrlen);
+
+            int sourcefd;
+            int matchres = matchAllAddr(opts->map, replacement, &sourcefd, opts);
+            if(matchres < 0) {
+                int errnum = -matchres;
+                // Return an error, first change syscall number to -1 (invalid)
+                regs.orig_rax = -1;
+                ptrace(PTRACE_SETREGS, target, 0, &regs);
+                // Run the syscall (will do nothing)
+                ptrace(PTRACE_SYSCALL, target, 0, 0);
+                waitpid(target, 0, 0);
+                // Return the error
+                regs.rax = -errnum;
+                ptrace(PTRACE_SETREGS, target, 0, &regs);
+            } else if(matchres == 1) {
+                if(opts->debug) printf("Tracer: replace address in memory\n");
+                // Replace network address
+                if(!ptrace_put_bind_args(target, &regs, socketfd, replacement, addrlen, opts->debug)) {
+                    fprintf(stderr, "force-bind: short write, cannot fit %d bytes into %d\n", addrlen, (socklen_t) regs.rdx);
+                    exit(EXIT_FAILURE);
+                }
+
+                ptrace(PTRACE_SETREGS, target, 0, &regs);
+            } else if(matchres == 2) {
+                if(opts->debug) printf("Tracer: replace system-call by dup2(%d, %d)\n", sourcefd, socketfd);
+                // Replace file descriptor
+                // replace orig_rax=__NR_bind rdi=socketfd rsi=addr rdx=addrlen
+                // with    orig_rax=__NR_dup2 rdi=oldfd    rsi=newfd
+                regs.orig_rax = __NR_dup2;
+                regs.rdi      = sourcefd;
+                regs.rsi      = socketfd;
+                ptrace(PTRACE_SETREGS, target, 0, &regs);
+                // Run the syscall (will do nothing)
+                ptrace(PTRACE_SYSCALL, target, 0, 0);
+                waitpid(target, 0, 0);
+                // Get registers from dup2() response
+                ptrace(PTRACE_GETREGS, target, 0, &regs);
+                // Return 0 on success, else the error
+                if(regs.rax > 0) regs.rax = 0;
+                ptrace(PTRACE_SETREGS, target, 0, &regs);
+            }
+
+            free(replacement);
+            free(addr);
+        }
     }
 }
 
@@ -697,7 +807,7 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
     if(matchaddr && *matchaddr){
         err = getaddrinfo2(matchaddr, &hints, &res);
         if(err) {
-            fprintf(stderr, "Cannot parse %s: %s\n", matchaddr, strerror(err));
+            fprintf(stderr, "Cannot parse match %s: %s\n", matchaddr, strerror(err));
             exit(EXIT_FAILURE);
         }
         cur->addr = copyAddr(res);
@@ -711,7 +821,7 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
             cur->replacement_fd = fd;
             cur->replacement = NULL;
             opts->require_ptrace = true;
-        } else if (len > 3 && replace[0] == 'f' && replace[1] == 'd' && replace[2] == '=') {
+        } else if (len > 3 && replace[0] == 's' && replace[1] == 'd' && replace[2] == '=') {
             int sd = atoi(&replace[3]);
             int fd = sd + 3;
             cur->replacement_fd = fd;
@@ -720,7 +830,7 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
         } else {
             err = getaddrinfo2(replace, &hints, &res);
             if(err) {
-                fprintf(stderr, "Cannot parse %s: %s\n", replace, strerror(err));
+                fprintf(stderr, "Cannot parse replacement %s: %s\n", replace, strerror(err));
                 exit(EXIT_FAILURE);
             }
             cur->replacement = copyAddr(res);
@@ -849,8 +959,14 @@ setReplacement(struct sockaddr *addr0, const struct sockaddr *repl0) {
     }
 }
 
+/* Return:
+ *      0       -   does not match, continue syscall
+ *      -errno  -   return -errno error
+ *      1       -   match new address
+ *      2       -   match file descriptor
+ */
 static int
-matchAllAddr(const struct mapping *map, struct sockaddr *sa, const struct cmdLineOpts *opts) {
+matchAllAddr(const struct mapping *map, struct sockaddr *sa, int *newfd, const struct cmdLineOpts *opts) {
     switch(sa->sa_family) {
         case AF_INET: {
             struct sockaddr_in *addr = (struct sockaddr_in *) sa;
@@ -864,16 +980,18 @@ matchAllAddr(const struct mapping *map, struct sockaddr *sa, const struct cmdLin
 
     char addr1[PATH_MAX], addr2[PATH_MAX], addr3[PATH_MAX];
     while(map) {
-        if(opts->verbose) printf("force-bind: try match %s with %s/%d (replace with %s)\n",
+        if(opts->verbose) printf("force-bind: try match %s with %s/%d (replace with %s or fd=%d)\n",
                 get_ip_str(sa, addr1, sizeof(addr1)),
                 get_ip_str(map->addr, addr2, sizeof(addr2)), map->prefix,
-                get_ip_str(map->replacement, addr3, sizeof(addr3)));
+                get_ip_str(map->replacement, addr3, sizeof(addr3)),
+                map->replacement_fd);
         if(matchAddr(map, sa, opts)) {
             if(map->replacement) {
                 setReplacement(sa, map->replacement);
                 return 1;
             } else if (map->replacement_fd) {
-                return map->replacement_fd;
+                *newfd = map->replacement_fd;
+                return 2;
             } else {
                 return -EACCES;
             }
@@ -893,26 +1011,29 @@ usageError(char *msg, char *pname)
     if (msg != NULL)
         fprintf(stderr, "%s\n", msg);
 
-#define fpe(msg) fprintf(stderr, "      " msg);
-    fprintf(stderr, "Usage: %s [options] TARGET_PROGRAM [ARGS ...]\n", pname);
-    fpe("Options\n");
-    fpe("-h                    Help\n");
-    fpe("-V                    Version information\n");
-    fpe("-m ADDR/PREFIX=ADDR   Replace bind() matching first ADDR/PREFIX with\n");
-    fpe("                      second ADDR\n");
-    fpe("-b ADDR               Replace all bind() with ADDR (if same family)\n");
-    fpe("-d                    Deny all bind()\n");
-    fpe("-t <nsecs>            Tracer delays 'nsecs' before inspecting target\n");
-    fpe("-D                    Debug messages\n");
-    fpe("-v                    Verbose\n");
-    fpe("-q                    Quiet\n");
-    fprintf(stderr, "\nLast rules (-m, -b, -d) are applied first.\n");
-    fprintf(stderr, "In the rules, ADDR can be:\n\n");
-    fpe("IP:PORT               Changes the bind target to specified address");
-    fpe("fd=N                  dup2() the specified inherited file descriptor");
-    fpe("                      in place")
-    fpe("sd=N                  same as fd=N but for systemd file descriptor. sd=0")
-    fpe("                      is thus equivalent to fd=3")
+    fprintf(stderr,
+        "Usage: %s [options] TARGET_PROGRAM [ARGS ...]\n", pname);
+    fprintf(stderr,
+        "Options\n"
+        "    -h                    Help\n"
+        "    -V                    Version information\n"
+        "    -m ADDR/PREFIX=ADDR   Replace bind() matching first ADDR/PREFIX with\n"
+        "                          second ADDR\n"
+        "    -b ADDR               Replace all bind() with ADDR (if same family)\n"
+        "    -d                    Deny all bind()\n"
+        "    -p                    Force seccomp-ptrace instead of only seccomp\n"
+        "    -D                    Debug messages\n"
+        "    -v                    Verbose\n"
+        "    -q                    Quiet\n"
+        "\n"
+        "Last rules (-m, -b, -d) are applied first.\n"
+        "In the rules, ADDR can be:\n"
+        "\n"
+        "    IP:PORT               Changes the bind target to specified address\n"
+        "    fd=N                  dup2() the specified inherited file descriptor\n"
+        "                          in place\n"
+        "    sd=N                  same as fd=N but for systemd file descriptor. sd=0\n"
+        "                          is thus equivalent to fd=3\n");
 #ifdef VERSION
     fprintf(stderr, "\nVersion: %s\n", VERSION);
 #endif
@@ -925,8 +1046,7 @@ parseCommandLineOptions(int argc, char *argv[], struct cmdLineOpts *opts)
 {
     int opt;
 
-    bzero(&opts, sizeof(struct cmdLineOpts));
-    opts->delaySecs = 0;
+    bzero(opts, sizeof(struct cmdLineOpts));
     opts->debug = false;
     opts->map = NULL;
     opts->require_ptrace = false;
@@ -943,8 +1063,8 @@ parseCommandLineOptions(int argc, char *argv[], struct cmdLineOpts *opts)
         } else if(!strcmp("-d", arg)) {              /* Deny */
             opts->map = parseMap(NULL, opts->map, opts, false);
 
-        } else if(!strcmp("-t", arg) && argv[i+1]) { /* Delay time before sending notification response */
-            opts->delaySecs = atoi(argv[++i]);
+        } else if(!strcmp("-p", arg)) {              /* Ptrace */
+            opts->require_ptrace = true;
 
         } else if(!strcmp("-D", arg)) {              /* Debug */
             opts->debug = true;
@@ -1020,6 +1140,8 @@ main(int argc, char *argv[])
        that arrive on that file descriptor. */
 
     if (opts.require_ptrace) {
+        if(opts.debug) printf("Tracer: use seccomp-ptrace method\n");
+
         /* Wait for the target process to signal STOP
          */
         int status;
@@ -1030,6 +1152,7 @@ main(int argc, char *argv[])
 
     } else {
 
+        if(opts.debug) printf("Tracer: use seccomp-only method\n");
         tracerPid = tracerProcess(sockPair, &opts);
 
         /* The parent process does not need the socket pair */

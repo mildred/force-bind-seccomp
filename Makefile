@@ -10,6 +10,9 @@ CFLAGS += -DVERSION='"$(shell git describe --always --dirty)"'
 force-bind: main.c scm_functions.c *.h
 	cc $(CFLAGS) -o $@ $(filter %.c,$+)
 
+parent-socket-activate: parent_soocket_activate.c *.h
+	cc $(CFLAGS) -o $@ $(filter %.c,$+)
+
 target-mkdir: target_mkdir.c *.h
 	cc $(CFLAGS) -o $@ $(filter %.c,$+)
 

@@ -11,7 +11,7 @@ static int getaddrinfo2(const char *nodeport0,
                        struct addrinfo **res) {
     size_t len = strlen(nodeport0);
     char nodeport[len+1];
-    strncpy(nodeport, nodeport0, len);
+    strncpy(nodeport, nodeport0, len+1);
 
     char *node = nodeport, *service = nodeport;
 

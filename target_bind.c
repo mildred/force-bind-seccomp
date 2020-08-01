@@ -47,25 +47,28 @@ int main(int argc, char *argv[]) {
       and) try the next address. */
 
    for (rp = result; rp != NULL; rp = rp->ai_next) {
-       printf("socket(%d, %d, %d)\n", rp->ai_family, rp->ai_socktype, rp->ai_protocol);
        sfd = socket(rp->ai_family, rp->ai_socktype,
                rp->ai_protocol);
+       printf("target: socket(%d, %d, %d) = %d\n", rp->ai_family, rp->ai_socktype, rp->ai_protocol, sfd);
        if (sfd == -1)
            continue;
 
-       printf("bind(%d, %p, %d)\n", sfd, (void*) rp->ai_addr, rp->ai_addrlen);
-       printf("(before) %p = %s\n", rp->ai_addr, get_ip_str(rp->ai_addr, addrstr, sizeof(addrstr)));
-       if (bind(sfd, rp->ai_addr, rp->ai_addrlen) == 0) {
-           printf("(after)  %p = %s\n", rp->ai_addr, get_ip_str(rp->ai_addr, addrstr, sizeof(addrstr)));
+       printf("target: bind(%d, %p, %d)\n", sfd, (void*) rp->ai_addr, rp->ai_addrlen);
+       printf("target (before): %p = %s\n", rp->ai_addr, get_ip_str(rp->ai_addr, addrstr, sizeof(addrstr)));
+       int res =bind(sfd, rp->ai_addr, rp->ai_addrlen);
+       if (res == 0) {
+           printf("target (after):  %p = %s\n", rp->ai_addr, get_ip_str(rp->ai_addr, addrstr, sizeof(addrstr)));
            break;                  /* Success */
        }
-       printf("(after)  %p = %s\n", rp->ai_addr, get_ip_str(rp->ai_addr, addrstr, sizeof(addrstr)));
+       printf("target: bind() returned with %d\n", res);
+       perror("target");
+       printf("target (after):  %p = %s\n", rp->ai_addr, get_ip_str(rp->ai_addr, addrstr, sizeof(addrstr)));
 
        close(sfd);
    }
 
    if (rp == NULL) {               /* No address succeeded */
-       perror("Could not bind");
+       perror("target: Could not bind");
        exit(EXIT_FAILURE);
    }
 
@@ -74,7 +77,7 @@ int main(int argc, char *argv[]) {
    /* Read datagrams and echo them back to sender */
 
    for (;;) {
-       printf("recvfrom(%d, %p, %d, ...)\n", sfd, buf, BUF_SIZE);
+       printf("target: recvfrom(%d, %p, %d, ...)\n", sfd, buf, BUF_SIZE);
        peer_addr_len = sizeof(struct sockaddr_storage);
        nread = recvfrom(sfd, buf, BUF_SIZE, 0,
                (struct sockaddr *) &peer_addr, &peer_addr_len);
@@ -87,7 +90,7 @@ int main(int argc, char *argv[]) {
                        peer_addr_len, host, NI_MAXHOST,
                        service, NI_MAXSERV, NI_NUMERICSERV);
        if (s == 0)
-           printf("Received %zd bytes from %s:%s\n",
+           printf("target: Received %zd bytes from %s:%s\n",
                    nread, host, service);
        else
            fprintf(stderr, "getnameinfo: %s\n", gai_strerror(s));
@@ -95,6 +98,6 @@ int main(int argc, char *argv[]) {
        if (sendto(sfd, buf, nread, 0,
                    (struct sockaddr *) &peer_addr,
                    peer_addr_len) != nread)
-           fprintf(stderr, "Error sending response\n");
+           fprintf(stderr, "target: Error sending response\n");
    }
 }
