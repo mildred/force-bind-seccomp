@@ -42,6 +42,9 @@ Known bugs
   subsequent listen() calls will be skipped
 - security issue: race condition when replacing the network address causing a
   malicious program to bind an otherwise forbidden address.
+- When the file descriptors are not passed by systemd (the service is started
+  while the socket was not active for example), force-bind should let the
+  process bind() and listen() normally
 
 History
 -------
