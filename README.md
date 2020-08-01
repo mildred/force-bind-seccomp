@@ -33,6 +33,16 @@ activation is needed.
 
 This is still a young project. Don't hesitate to report bugs or submit fixes.
 
+Known bugs
+----------
+
+- parent process always exits with status 0 in seccomp-only mode
+- if the process close a systemd activated socket and opens a new socket on the
+  same file descriptor number that is not catched by force-bind, then the
+  subsequent listen() calls will be skipped
+- security issue: race condition when replacing the network address causing a
+  malicious program to bind an otherwise forbidden address.
+
 History
 -------
 

@@ -189,6 +189,11 @@ installPtraceFilter(void)
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_bind, 0, 1),
         BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_TRACE),
 
+        /* listen() triggers notification to user-space tracer */
+
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_listen, 0, 1),
+        BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_TRACE),
+
         /* Every other system call is allowed */
 
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
@@ -593,7 +598,7 @@ tracerProcess(int sockPair[2], struct cmdLineOpts *opts)
 }
 
 static int
-wait_for_ptrace(pid_t target, struct cmdLineOpts *opts){
+wait_for_ptrace(pid_t target, int *res_status, struct cmdLineOpts *opts){
     int status;
 
     while (1) {
@@ -601,12 +606,12 @@ wait_for_ptrace(pid_t target, struct cmdLineOpts *opts){
         waitpid(target, &status, 0);
         if(opts->debug) printf("Tracer: [waitpid status: 0x%08x]\n", status);
         /* Is it our filter for the open syscall? */
-        if (status >> 8 == (SIGTRAP | (PTRACE_EVENT_SECCOMP << 8)) &&
-            ptrace(PTRACE_PEEKUSER, target,
-                   sizeof(long)*ORIG_RAX, 0) == __NR_bind)
+        if (status >> 8 == (SIGTRAP | (PTRACE_EVENT_SECCOMP << 8)))
             return 0;
-        if (WIFEXITED(status))
+        if (WIFEXITED(status)) {
+            if(res_status) *res_status = status;
             return 1;
+        }
     }
 }
 
@@ -680,78 +685,123 @@ static bool ptrace_put_bind_args(pid_t target, struct user_regs_struct *regs, in
     return true;
 }
 
-static void
+struct replaced_fds;
+struct replaced_fds {
+    int                  fd;
+    struct replaced_fds *next;
+};
+
+static int
 process_ptrace(pid_t target, struct cmdLineOpts *opts) {
+    struct replaced_fds *replaced_fds = NULL;
+    int res_status = 0;
     while(1) {
         /* Wait for open syscall start */
-        if (wait_for_ptrace(target, opts) != 0) break;
+        if (wait_for_ptrace(target, &res_status, opts) != 0) return res_status;
 
-        /* Find out file and re-direct if it is the target */
+        /* Read registers */
         struct user_regs_struct regs;
         ptrace(PTRACE_GETREGS, target, 0, &regs);
 
-        int socketfd;
-        socklen_t addrlen;
-        struct sockaddr *addr;
+        switch(regs.orig_rax) {
+            case __NR_bind: {
+                int socketfd;
+                socklen_t addrlen;
+                struct sockaddr *addr;
 
-        ptrace_read_bind_args(target, &regs, &socketfd, &addr, &addrlen, opts->debug);
+                ptrace_read_bind_args(target, &regs, &socketfd, &addr, &addrlen, opts->debug);
 
-        if(opts->debug) {
-            char addrstring[PATH_MAX];
-            printf("Tracer: intercept bind(%d, %s)\n", socketfd, get_ip_str(addr, addrstring, sizeof(addrstring)));
-        }
-
-        if (addr->sa_family != AF_INET && addr->sa_family != AF_INET6) {
-            continue;
-        } else {
-            struct sockaddr *replacement = malloc(addrlen);
-            if (replacement == NULL)
-                errExit("Tracer: malloc");
-            memcpy(replacement, addr, addrlen);
-
-            int sourcefd;
-            int matchres = matchAllAddr(opts->map, replacement, &sourcefd, opts);
-            if(matchres < 0) {
-                int errnum = -matchres;
-                // Return an error, first change syscall number to -1 (invalid)
-                regs.orig_rax = -1;
-                ptrace(PTRACE_SETREGS, target, 0, &regs);
-                // Run the syscall (will do nothing)
-                ptrace(PTRACE_SYSCALL, target, 0, 0);
-                waitpid(target, 0, 0);
-                // Return the error
-                regs.rax = -errnum;
-                ptrace(PTRACE_SETREGS, target, 0, &regs);
-            } else if(matchres == 1) {
-                if(opts->debug) printf("Tracer: replace address in memory\n");
-                // Replace network address
-                if(!ptrace_put_bind_args(target, &regs, socketfd, replacement, addrlen, opts->debug)) {
-                    fprintf(stderr, "force-bind: short write, cannot fit %d bytes into %d\n", addrlen, (socklen_t) regs.rdx);
-                    exit(EXIT_FAILURE);
+                if(opts->debug) {
+                    char addrstring[PATH_MAX];
+                    printf("Tracer: intercept bind(%d, %s)\n", socketfd, get_ip_str(addr, addrstring, sizeof(addrstring)));
                 }
 
-                ptrace(PTRACE_SETREGS, target, 0, &regs);
-            } else if(matchres == 2) {
-                if(opts->debug) printf("Tracer: replace system-call by dup2(%d, %d)\n", sourcefd, socketfd);
-                // Replace file descriptor
-                // replace orig_rax=__NR_bind rdi=socketfd rsi=addr rdx=addrlen
-                // with    orig_rax=__NR_dup2 rdi=oldfd    rsi=newfd
-                regs.orig_rax = __NR_dup2;
-                regs.rdi      = sourcefd;
-                regs.rsi      = socketfd;
-                ptrace(PTRACE_SETREGS, target, 0, &regs);
-                // Run the syscall (will do nothing)
-                ptrace(PTRACE_SYSCALL, target, 0, 0);
-                waitpid(target, 0, 0);
-                // Get registers from dup2() response
-                ptrace(PTRACE_GETREGS, target, 0, &regs);
-                // Return 0 on success, else the error
-                if(regs.rax > 0) regs.rax = 0;
-                ptrace(PTRACE_SETREGS, target, 0, &regs);
-            }
+                if (addr->sa_family != AF_INET && addr->sa_family != AF_INET6) {
+                    continue;
+                } else {
+                    struct sockaddr *replacement = malloc(addrlen);
+                    if (replacement == NULL)
+                        errExit("Tracer: malloc");
+                    memcpy(replacement, addr, addrlen);
 
-            free(replacement);
-            free(addr);
+                    int sourcefd;
+                    int matchres = matchAllAddr(opts->map, replacement, &sourcefd, opts);
+                    if(matchres < 0) {
+                        int errnum = -matchres;
+                        // Return an error, first change syscall number to -1 (invalid)
+                        regs.orig_rax = -1;
+                        ptrace(PTRACE_SETREGS, target, 0, &regs);
+                        // Run the syscall (will do nothing)
+                        ptrace(PTRACE_SYSCALL, target, 0, 0);
+                        waitpid(target, 0, 0);
+                        // Return the error
+                        regs.rax = -errnum;
+                        ptrace(PTRACE_SETREGS, target, 0, &regs);
+                    } else if(matchres == 1) {
+                        if(opts->debug) printf("Tracer: replace address in memory\n");
+                        // Replace network address
+                        if(!ptrace_put_bind_args(target, &regs, socketfd, replacement, addrlen, opts->debug)) {
+                            fprintf(stderr, "force-bind: short write, cannot fit %d bytes into %d\n", addrlen, (socklen_t) regs.rdx);
+                            exit(EXIT_FAILURE);
+                        }
+
+                        ptrace(PTRACE_SETREGS, target, 0, &regs);
+                    } else if(matchres == 2) {
+                        if(opts->debug) printf("Tracer: replace system-call by dup2(%d, %d)\n", sourcefd, socketfd);
+                        struct replaced_fds *replace_fd = malloc(sizeof(struct replaced_fds));
+                        if (replace_fd == NULL) {
+                            fprintf(stderr, "force-bind: malloc failed\n");
+                        } else {
+                            bzero(replace_fd, sizeof(struct replaced_fds));
+                            replace_fd->next = replaced_fds;
+                            replace_fd->fd = socketfd;
+                            replaced_fds = replace_fd;
+                        }
+                        // Replace file descriptor
+                        // replace orig_rax=__NR_bind rdi=socketfd rsi=addr rdx=addrlen
+                        // with    orig_rax=__NR_dup2 rdi=oldfd    rsi=newfd
+                        regs.orig_rax = __NR_dup2;
+                        regs.rdi      = sourcefd;
+                        regs.rsi      = socketfd;
+                        ptrace(PTRACE_SETREGS, target, 0, &regs);
+                        // Run the syscall (will do nothing)
+                        ptrace(PTRACE_SYSCALL, target, 0, 0);
+                        waitpid(target, 0, 0);
+                        // Get registers from dup2() response
+                        ptrace(PTRACE_GETREGS, target, 0, &regs);
+                        // Return 0 on success, else the error
+                        if(regs.rax > 0) regs.rax = 0;
+                        ptrace(PTRACE_SETREGS, target, 0, &regs);
+                    }
+
+                    free(replacement);
+                    free(addr);
+                    break;
+                }
+                case __NR_listen: {
+                    int fd = regs.rdi;
+                    // Check if the file descriptor was replaced
+                    struct replaced_fds *rfd = replaced_fds;
+                    while(rfd) {
+                        if(rfd->fd == fd) break;
+                        rfd = rfd->next;
+                    }
+                    if(rfd) {
+                        // ignore listen syscall
+                        if(opts->debug) printf("Tracer: listen(%d, %d), ignoring\n", fd, regs.rsi);
+                        // first change syscall number to -1 (invalid) and run
+                        // it (does nothing)
+                        regs.orig_rax = -1;
+                        ptrace(PTRACE_SETREGS, target, 0, &regs);
+                        ptrace(PTRACE_SYSCALL, target, 0, 0);
+                        waitpid(target, 0, 0);
+                        // Return 0 as if it succeeded
+                        regs.rax = 0;
+                        ptrace(PTRACE_SETREGS, target, 0, &regs);
+                    }
+                    break;
+                }
+            }
         }
     }
 }
@@ -1232,7 +1282,7 @@ main(int argc, char *argv[])
         waitpid(targetPid, &status, 0);
 
         ptrace(PTRACE_SETOPTIONS, targetPid, 0, PTRACE_O_TRACESECCOMP);
-        process_ptrace(targetPid, &opts);
+        exit(process_ptrace(targetPid, &opts));
 
     } else {
 
