@@ -774,6 +774,7 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
     char *replace = NULL;
 
     bzero(cur, sizeof(struct mapping));
+    cur->next = next;
     bzero(map, sizeof(map));
     if(map0) strncpy(map, map0, maplen);
 
@@ -804,7 +805,7 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
         printf("parse map %s %s %s\n", matchaddr, prefix, replace);
     }
 
-    if(matchaddr && *matchaddr){
+    if(matchaddr && *matchaddr && matchaddr[0] != ':' && !prefix){
         err = getaddrinfo2(matchaddr, &hints, &res);
         if(err) {
             fprintf(stderr, "Cannot parse match %s: %s\n", matchaddr, strerror(err));
@@ -816,12 +817,12 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
 
     if(replace && *replace){
         size_t len = strlen(replace);
-        if (len > 3 && replace[0] == 'f' && replace[1] == 'd' && replace[2] == '=') {
+        if (len > 3 && replace[0] == 'f' && replace[1] == 'd' && (replace[2] == '=' || replace[2] == '-')) {
             int fd = atoi(&replace[3]);
             cur->replacement_fd = fd;
             cur->replacement = NULL;
             opts->require_ptrace = true;
-        } else if (len > 3 && replace[0] == 's' && replace[1] == 'd' && replace[2] == '=') {
+        } else if (len > 3 && replace[0] == 's' && replace[1] == 'd' && (replace[2] == '=' || replace[2] == '-')) {
             int sd = atoi(&replace[3]);
             int fd = sd + 3;
             cur->replacement_fd = fd;
@@ -839,20 +840,65 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
         }
     }
 
-    if(cur->addr && cur->replacement && cur->addr->sa_family != cur->replacement->sa_family) {
-        fprintf(stderr, "Not the same address family on both sides: %s", map0);
-        exit(EXIT_FAILURE);
+
+    if(matchaddr && *matchaddr && matchaddr[0] == ':'){
+
+        bool num = 0;
+
+        if(!cur->replacement || cur->replacement->sa_family == AF_INET) {
+            char matchaddr4[PATH_MAX];
+            snprintf(matchaddr4, PATH_MAX, "0.0.0.0%s", matchaddr);
+            err = getaddrinfo2(matchaddr4, &hints, &res);
+            if(err) {
+                fprintf(stderr, "Cannot parse IPv4 match %s: %s\n", matchaddr, strerror(err));
+                exit(EXIT_FAILURE);
+            }
+            cur->addr = copyAddr(res);
+            cur->prefix = 32;
+            freeaddrinfo(res);
+            num++;
+        }
+
+        if(!cur->replacement || cur->replacement->sa_family == AF_INET6) {
+            if(num) {
+                next = cur;
+                cur = malloc(sizeof(struct mapping));
+                memcpy(cur, next, sizeof(struct mapping));
+                cur->next = next;
+                num--;
+            }
+
+            char matchaddr6[PATH_MAX];
+            snprintf(matchaddr6, PATH_MAX, "[::]%s", matchaddr);
+            err = getaddrinfo2(matchaddr6, &hints, &res);
+            if(err) {
+                fprintf(stderr, "Cannot parse IPv6 match %s: %s\n", matchaddr, strerror(err));
+                exit(EXIT_FAILURE);
+            }
+            cur->addr = copyAddr(res);
+            cur->prefix = 128;
+            freeaddrinfo(res);
+            num++;
+        }
+
+    } else {
+
+        if(prefix) {
+            cur->prefix = atoi(prefix);
+        } else if (cur->addr && cur->addr->sa_family == AF_INET) {
+            cur->prefix = 32;
+        } else if (cur->addr && cur->addr->sa_family == AF_INET6) {
+            cur->prefix = 128;
+        }
+
+
+        if(cur->addr && cur->replacement && cur->addr->sa_family != cur->replacement->sa_family) {
+            fprintf(stderr, "Not the same address family on both sides: %s", map0);
+            exit(EXIT_FAILURE);
+        }
+
     }
 
-    if(prefix) {
-        cur->prefix = atoi(prefix);
-    } else if (cur->addr && cur->addr->sa_family == AF_INET) {
-        cur->prefix = 32;
-    } else if (cur->addr && cur->addr->sa_family == AF_INET6) {
-        cur->prefix = 128;
-    }
-
-    cur->next = next;
     return cur;
 }
 
@@ -1017,8 +1063,7 @@ usageError(char *msg, char *pname)
         "Options\n"
         "    -h                    Help\n"
         "    -V                    Version information\n"
-        "    -m ADDR/PREFIX=ADDR   Replace bind() matching first ADDR/PREFIX with\n"
-        "                          second ADDR\n"
+        "    -m MATCH=ADDR         Replace bind() matching first MATCH with ADDR\n"
         "    -b ADDR               Replace all bind() with ADDR (if same family)\n"
         "    -d                    Deny all bind()\n"
         "    -p                    Force seccomp-ptrace instead of only seccomp\n"
@@ -1026,14 +1071,46 @@ usageError(char *msg, char *pname)
         "    -v                    Verbose\n"
         "    -q                    Quiet\n"
         "\n"
-        "Last rules (-m, -b, -d) are applied first.\n"
+        "Last rules (-m, -b, -d) are applied first so you can put your general policy\n"
+        "first on your command-line and any following argument can override it.\n"
+        "\n"
+        "With the -m rule, MATCH pattern can be:\n"
+        "\n"
+        "    :PORT                 Matches both IPv4 and IPv6 listening on PORT\n"
+        "    ADDR:PORT/PREFIX      Matches address with given port with the netmark\n"
+        "                          corresponding to PREFIX applied first on both IPs\n"
+        "                          IPv6 address must be enclosed in squared brackets.\n"
+        "\n"
         "In the rules, ADDR can be:\n"
         "\n"
         "    IP:PORT               Changes the bind target to specified address\n"
-        "    fd=N                  dup2() the specified inherited file descriptor\n"
+        "    fd=N or fd-N          dup2() the specified inherited file descriptor\n"
         "                          in place\n"
-        "    sd=N                  same as fd=N but for systemd file descriptor. sd=0\n"
-        "                          is thus equivalent to fd=3\n");
+        "    sd=N or sd-N          same as fd=N but for systemd file descriptor. sd=0\n"
+        "                          is thus equivalent to fd=3\n"
+        "\n"
+        "Examples:\n"
+        "\n"
+        "  * force-bind -m 0.0.0.0:80/0=127.0.0.1:8080 progname args...\n"
+        "\n"
+        "    Replace binds from any IPv4 address port 80 to localhost-only port\n"
+        "    8080. IPv6 binds are allowed.\n"
+        "\n"
+        "  * force-bind -d -m '[::]:80/0=[::1]:8080' progname args...\n"
+        "\n"
+        "    Replace binds from any IPv6 address port 80 to localhost-only port\n"
+        "    8080. IPv4 binds are denied.\n"
+        "\n"
+        "  * force-bind -d -b '[::1]:8081' -b '127.0.0.1:8080' progname args...\n"
+        "\n"
+        "    Replace binds from any IPv6 address to localhost port 8081 and from\n"
+        "    any IPv4 address to localhost port 8080.\n"
+        "\n"
+        "  * force-bind -m ':80=sd=0' -m ':80=fd=4' progname args...\n"
+        "\n"
+        "    Replace any bind to port 80 using first socket from systemd socket\n"
+        "    activation. Any port 81 is replaced by passed file descriptor 4.\n"
+        "\n");
 #ifdef VERSION
     fprintf(stderr, "\nVersion: %s\n", VERSION);
 #endif
