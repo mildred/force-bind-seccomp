@@ -1026,11 +1026,18 @@ matchAllAddr(const struct mapping *map, struct sockaddr *sa, int *newfd, const s
 
     char addr1[PATH_MAX], addr2[PATH_MAX], addr3[PATH_MAX];
     while(map) {
-        if(opts->verbose) printf("force-bind: try match %s with %s/%d (replace with %s or fd=%d)\n",
-                get_ip_str(sa, addr1, sizeof(addr1)),
-                get_ip_str(map->addr, addr2, sizeof(addr2)), map->prefix,
-                get_ip_str(map->replacement, addr3, sizeof(addr3)),
-                map->replacement_fd);
+        if(opts->verbose) {
+            if(map->replacement)
+                printf("force-bind: try match %s with %s/%d (replace with %s)\n",
+                    get_ip_str(sa, addr1, sizeof(addr1)),
+                    get_ip_str(map->addr, addr2, sizeof(addr2)), map->prefix,
+                    get_ip_str(map->replacement, addr3, sizeof(addr3)));
+            else
+                printf("force-bind: try match %s with %s/%d (replace with fd=%d)\n",
+                    get_ip_str(sa, addr1, sizeof(addr1)),
+                    get_ip_str(map->addr, addr2, sizeof(addr2)), map->prefix,
+                    map->replacement_fd);
+        }
         if(matchAddr(map, sa, opts)) {
             if(map->replacement) {
                 setReplacement(sa, map->replacement);
