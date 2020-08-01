@@ -62,6 +62,7 @@
 */
 #define _GNU_SOURCE
 #include <sys/types.h>
+#include <sys/ptrace.h>
 #include <sys/prctl.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -103,11 +104,13 @@ struct mapping {
     struct sockaddr *addr;
     int prefix;
     struct sockaddr *replacement;
+    int replacement_fd;
     struct mapping *next;
 };
 
 struct cmdLineOpts {
     int  delaySecs;     /* Delay time for responding to notifications */
+    bool require_ptrace;
     bool debug;
     bool quiet;
     bool verbose;
@@ -174,6 +177,39 @@ installNotifyFilter(void)
     return notifyFd;
 }
 
+static void
+installPtraceFilter(void)
+{
+    struct sock_filter filter[] = {
+        X86_64_CHECK_ARCH_AND_LOAD_SYSCALL_NR,
+
+        /* bind() triggers notification to user-space tracer */
+
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_bind, 0, 1),
+        BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_TRACE),
+
+        /* Every other system call is allowed */
+
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+
+    struct sock_fprog prog = {
+        .len = (unsigned short) (sizeof(filter) / sizeof(filter[0])),
+        .filter = filter,
+    };
+
+    ptrace(PTRACE_TRACEME, 0, 0, 0);
+
+    /* To avoid the need for CAP_SYS_ADMIN */
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1) {
+        errExit("prctl(PR_SET_NO_NEW_PRIVS)");
+    }
+
+    if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) == -1) {
+        errExit("when setting seccomp filter");
+    }
+}
+
 /* Handler for the SIGINT signal in the target process */
 
 static void
@@ -210,7 +246,7 @@ static pid_t
 targetProcess(int sockPair[2], char *argv[], struct cmdLineOpts *opts)
 {
     pid_t targetPid;
-    int notifyFd;
+    int notifyFd = 0;
     struct sigaction sa;
 
     targetPid = fork();
@@ -234,23 +270,33 @@ targetProcess(int sockPair[2], char *argv[], struct cmdLineOpts *opts)
 
     /* Install seccomp filter(s) */
 
-    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))
-        errExit("prctl");
+    if(opts->require_ptrace) {
+        installPtraceFilter();
 
-    notifyFd = installNotifyFilter();
+        /* Signal the tracing process we are ready
+         * http://www.alfonsobeato.net/c/filter-and-modify-system-calls-with-seccomp-and-ptrace/
+         * http://www.alfonsobeato.net/c/modifying-system-call-arguments-with-ptrace/
+         */
+        kill(getpid(), SIGSTOP);
+    } else {
+        if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))
+            errExit("prctl");
 
-    /* Pass the notification file descriptor to the tracing process over
-       a UNIX domain socket */
+        notifyFd = installNotifyFilter();
 
-    if (sendfd(sockPair[0], notifyFd) == -1)
-        errExit("sendfd");
+        /* Pass the notification file descriptor to the tracing process over
+           a UNIX domain socket */
 
-    /* Notification and socket FDs are no longer needed in target process */
+        if (sendfd(sockPair[0], notifyFd) == -1)
+            errExit("sendfd");
 
-    if (close(notifyFd) == -1)
-        errExit("close-target-notify-fd");
+        /* Notification and socket FDs are no longer needed in target process */
 
-    closeSocketPair(sockPair);
+        if (close(notifyFd) == -1)
+            errExit("close-target-notify-fd");
+
+        closeSocketPair(sockPair);
+    }
 
     /* Exec into the designated process */
 
@@ -451,7 +497,7 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
             if(matchres < 0) {
                 resp->flags = 0;
                 resp->error = -matchres;
-            } else if(matchres) {
+            } else if(matchres == 1) {
                 char repladdrstring[PATH_MAX];
                 if(!opts->quiet) printf("force-bind: replace %s with %s\n",
                         get_ip_str(addr, addrstring, sizeof(addrstring)),
@@ -566,6 +612,40 @@ tracerProcess(int sockPair[2], struct cmdLineOpts *opts)
     exit(EXIT_SUCCESS);         /* NOTREACHED */
 }
 
+static int
+wait_for_ptrace(pid_t target, struct cmdLineOpts *opts){
+    int status;
+
+    while (1) {
+        ptrace(PTRACE_CONT, target, 0, 0);
+        waitpid(target, &status, 0);
+        if(opts->debug) printf("Tracer: [waitpid status: 0x%08x]\n", status);
+        /* Is it our filter for the open syscall? */
+        if (status >> 8 == (SIGTRAP | (PTRACE_EVENT_SECCOMP << 8)) &&
+            ptrace(PTRACE_PEEKUSER, target,
+                   sizeof(long)*ORIG_RAX, 0) == __NR_bind)
+            return 0;
+        if (WIFEXITED(status))
+            return 1;
+    }
+}
+
+static void
+process_ptrace(pid_t target, struct cmdLineOpts *opts) {
+    while(1) {
+        /* Wait for open syscall start */
+        if (wait_for_ptrace(target, opts) != 0) break;
+
+        /* Find out file and re-direct if it is the target */
+
+        read_file(child, orig_file);
+        printf("[Opening %s]\n", orig_file);
+
+        if (strcmp(file_to_avoid, orig_file) == 0)
+            redirect_file(child, file_to_redirect);
+    }
+}
+
 static struct sockaddr *
 copyAddr(struct addrinfo *info) {
     struct sockaddr *res = malloc(info->ai_addrlen);
@@ -625,13 +705,28 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
     }
 
     if(replace && *replace){
-        err = getaddrinfo2(replace, &hints, &res);
-        if(err) {
-            fprintf(stderr, "Cannot parse %s: %s\n", replace, strerror(err));
-            exit(EXIT_FAILURE);
+        size_t len = strlen(replace);
+        if (len > 3 && replace[0] == 'f' && replace[1] == 'd' && replace[2] == '=') {
+            int fd = atoi(&replace[3]);
+            cur->replacement_fd = fd;
+            cur->replacement = NULL;
+            opts->require_ptrace = true;
+        } else if (len > 3 && replace[0] == 'f' && replace[1] == 'd' && replace[2] == '=') {
+            int sd = atoi(&replace[3]);
+            int fd = sd + 3;
+            cur->replacement_fd = fd;
+            cur->replacement = NULL;
+            opts->require_ptrace = true;
+        } else {
+            err = getaddrinfo2(replace, &hints, &res);
+            if(err) {
+                fprintf(stderr, "Cannot parse %s: %s\n", replace, strerror(err));
+                exit(EXIT_FAILURE);
+            }
+            cur->replacement = copyAddr(res);
+            cur->replacement_fd = 0;
+            freeaddrinfo(res);
         }
-        cur->replacement = copyAddr(res);
-        freeaddrinfo(res);
     }
 
     if(cur->addr && cur->replacement && cur->addr->sa_family != cur->replacement->sa_family) {
@@ -777,6 +872,8 @@ matchAllAddr(const struct mapping *map, struct sockaddr *sa, const struct cmdLin
             if(map->replacement) {
                 setReplacement(sa, map->replacement);
                 return 1;
+            } else if (map->replacement_fd) {
+                return map->replacement_fd;
             } else {
                 return -EACCES;
             }
@@ -801,17 +898,23 @@ usageError(char *msg, char *pname)
     fpe("Options\n");
     fpe("-h                    Help\n");
     fpe("-V                    Version information\n");
-    fpe("-m ADDR/PREFIX=ADDR   Replace bind() matching first ADDR/PREFIX with\n"
-        "                      second ADDR (ADDR is IP:PORT)\n");
+    fpe("-m ADDR/PREFIX=ADDR   Replace bind() matching first ADDR/PREFIX with\n");
+    fpe("                      second ADDR\n");
     fpe("-b ADDR               Replace all bind() with ADDR (if same family)\n");
     fpe("-d                    Deny all bind()\n");
     fpe("-t <nsecs>            Tracer delays 'nsecs' before inspecting target\n");
     fpe("-D                    Debug messages\n");
     fpe("-v                    Verbose\n");
     fpe("-q                    Quiet\n");
-    printf("\nLast rules (-m, -b, -d) are applied first.\n");
+    fprintf(stderr, "\nLast rules (-m, -b, -d) are applied first.\n");
+    fprintf(stderr, "In the rules, ADDR can be:\n\n");
+    fpe("IP:PORT               Changes the bind target to specified address");
+    fpe("fd=N                  dup2() the specified inherited file descriptor");
+    fpe("                      in place")
+    fpe("sd=N                  same as fd=N but for systemd file descriptor. sd=0")
+    fpe("                      is thus equivalent to fd=3")
 #ifdef VERSION
-    printf("\nVersion: %s\n", VERSION);
+    fprintf(stderr, "\nVersion: %s\n", VERSION);
 #endif
 }
 
@@ -822,9 +925,11 @@ parseCommandLineOptions(int argc, char *argv[], struct cmdLineOpts *opts)
 {
     int opt;
 
+    bzero(&opts, sizeof(struct cmdLineOpts));
     opts->delaySecs = 0;
     opts->debug = false;
     opts->map = NULL;
+    opts->require_ptrace = false;
 
     int i;
     for(i = 1; argv[i]; i++){
@@ -914,21 +1019,33 @@ main(int argc, char *argv[])
        file descriptor from 'sockPair[1]' and then handles the notifications
        that arrive on that file descriptor. */
 
-    tracerPid = tracerProcess(sockPair, &opts);
+    if (opts.require_ptrace) {
+        /* Wait for the target process to signal STOP
+         */
+        int status;
+        waitpid(targetPid, &status, 0);
 
-    /* The parent process does not need the socket pair */
+        ptrace(PTRACE_SETOPTIONS, targetPid, 0, PTRACE_O_TRACESECCOMP);
+        process_ptrace(targetPid, &opts);
 
-    closeSocketPair(sockPair);
+    } else {
 
-    /* Wait for the target process to terminate */
+        tracerPid = tracerProcess(sockPair, &opts);
 
-    waitpid(targetPid, NULL, 0);
-    if(opts.debug) printf("Parent: target process has terminated\n");
+        /* The parent process does not need the socket pair */
 
-    /* After the target process has terminated, kill the tracer process */
+        closeSocketPair(sockPair);
 
-    if(opts.debug) printf("Parent: killing tracer\n");
-    kill(tracerPid, SIGTERM);
+        /* Wait for the target process to terminate */
+
+        waitpid(targetPid, NULL, 0);
+        if(opts.debug) printf("Parent: target process has terminated\n");
+
+        /* After the target process has terminated, kill the tracer process */
+
+        if(opts.debug) printf("Parent: killing tracer\n");
+        kill(tracerPid, SIGTERM);
+    }
 
     exit(EXIT_SUCCESS);
 }
