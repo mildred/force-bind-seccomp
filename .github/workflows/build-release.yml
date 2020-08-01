@@ -1,0 +1,64 @@
+# This is a basic workflow to help you get started with Actions
+
+name: CI
+
+# Controls when the action will run. Triggers the workflow on push or pull request
+# events but only for the master branch
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - v*
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  # This workflow contains a single job called "build"
+  build:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-latest
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+    # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+    - uses: actions/checkout@v2
+
+    - name: Git
+      run: |
+        git fetch --tags --unshallow origin
+        git status
+        echo Version:
+        git describe --always
+
+    - name: Construct release name
+      id: vars
+      run: |
+        if [[ "${GITHUB_REF#refs/tags/}" = "${GITHUB_REF#refs/*/}" ]]; then
+          echo ::set-output name=prerelease::false
+          echo ::set-output name=release_name::${GITHUB_REF#refs/*/}
+        else
+          echo ::set-output name=prerelease::true
+          echo ::set-output name=release_name::latest-${GITHUB_REF#refs/*/}
+          git push origin +HEAD:refs/tags/latest-${GITHUB_REF#refs/*/}
+        fi
+
+    - name: Build
+      run: |
+        make VERSION=$(git describe --always) force-bind
+
+    - name: package
+      run: |
+        mkdir dist
+        cp force-bind dist/force-bind-${{ steps.vars.outputs.release_name }}
+        tar Jcf dist/force-bind-${{ steps.vars.outputs.release_name }}.tar.xz force-bind
+
+    # https://github.com/marketplace/actions/create-release
+    - name: Release
+      uses: ncipollo/release-action@v1
+      with:
+        artifacts: "dist/*"
+        allowUpdates: true
+        prerelease: ${{ fromJson(steps.vars.outputs.prerelease) }}
+        tag: ${{ steps.vars.outputs.release_name }}
+        token: ${{ secrets.GITHUB_TOKEN }}
+
