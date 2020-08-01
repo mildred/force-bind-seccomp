@@ -21,6 +21,10 @@ jobs:
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
     # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+
+    - name: Setup C++ environment
+      uses: kurocha/setup-cpp@v1
+
     - uses: actions/checkout@v2
 
     - name: Git
@@ -44,7 +48,7 @@ jobs:
 
     - name: Build
       run: |
-        make VERSION=$(git describe --always) force-bind
+        make force-bind
 
     - name: package
       run: |
