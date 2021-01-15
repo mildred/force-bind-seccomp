@@ -6,6 +6,12 @@
 #include <netdb.h>
 
 
+/**
+ * Searches in `nodeport0` the `:` character (parsing correctly IPv6 addresses
+ * if enclosed within `[` and `]`) and split it into two strings: the node and
+ * the port. Calls `getaddrinfo()` with the splitted strings and the resulting
+ * arguments.
+ */
 static int getaddrinfo2(const char *nodeport0,
                        const struct addrinfo *hints,
                        struct addrinfo **res) {
@@ -35,6 +41,9 @@ static int getaddrinfo2(const char *nodeport0,
     return getaddrinfo(node, service, hints, res);
 }
 
+/**
+ * Convert and IP address to a string
+ */
 static char *
 get_ip_str(const struct sockaddr *sa, char *s, size_t maxlen)
 {

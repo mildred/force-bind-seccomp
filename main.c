@@ -475,6 +475,7 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
             memcpy(replacement, addr, addrlen);
 
             int newfd;
+            // FIXME: handle multiple replacement
             int matchres = matchAllAddr(opts->map, replacement, &newfd, opts);
             if(matchres < 0) {
                 resp->flags = 0;
@@ -725,6 +726,7 @@ process_ptrace(pid_t target, struct cmdLineOpts *opts) {
                     memcpy(replacement, addr, addrlen);
 
                     int sourcefd;
+                    // FIXME: handle multiple replacement
                     int matchres = matchAllAddr(opts->map, replacement, &sourcefd, opts);
                     if(matchres < 0) {
                         int errnum = -matchres;
@@ -861,7 +863,7 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
             fprintf(stderr, "Cannot parse match %s: %s\n", matchaddr, strerror(err));
             exit(EXIT_FAILURE);
         }
-        cur->addr = copyAddr(res);
+        cur->addr = copyAddr(res); // FIXME: handle ai_next
         freeaddrinfo(res);
     }
 
@@ -884,7 +886,7 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
                 fprintf(stderr, "Cannot parse replacement %s: %s\n", replace, strerror(err));
                 exit(EXIT_FAILURE);
             }
-            cur->replacement = copyAddr(res);
+            cur->replacement = copyAddr(res); // FIXME: handle ai_next
             cur->replacement_fd = 0;
             freeaddrinfo(res);
         }
@@ -983,6 +985,8 @@ matchAddr(const struct mapping *map, const struct sockaddr *sa, const struct cmd
     if (!map->addr) return true;
     if (sa->sa_family != map->addr->sa_family) return false;
 
+    // FIXME: handle next address in map->addr
+
     switch(sa->sa_family) {
         case AF_INET: {
             struct sockaddr_in *addr = (struct sockaddr_in *) sa;
@@ -997,7 +1001,7 @@ matchAddr(const struct mapping *map, const struct sockaddr *sa, const struct cmd
             struct in_addr map_net_addr = netAddrIpv4(map->prefix, &map_addr->sin_addr);
             if (net_addr.s_addr != map_net_addr.s_addr) return false;
 
-            break;
+            return true;
         }
 
         case AF_INET6: {
@@ -1014,14 +1018,12 @@ matchAddr(const struct mapping *map, const struct sockaddr *sa, const struct cmd
             for(int i = 0; i < 16; ++i)
                 if (net_addr.s6_addr[i] != map_net_addr.s6_addr[i]) return false;
 
-            break;
+            return true;
         }
 
         default:
             return false;
     }
-
-    return true;
 }
 
 static void
@@ -1055,11 +1057,18 @@ setReplacement(struct sockaddr *addr0, const struct sockaddr *repl0) {
     }
 }
 
-/* Return:
+/**
+ * Match the given `sa` address and replace it with the new address from the
+ * `map` mappings or fill in `newfd` for file descriptor replacement.
+ *
+ * Return:
  *      0       -   does not match, continue syscall
  *      -errno  -   return -errno error
  *      1       -   match new address
  *      2       -   match file descriptor
+ *
+ * FIXME: for replacement (argument `sa`) a list should be provided to allow to
+ * replace with multiple addresses
  */
 static int
 matchAllAddr(const struct mapping *map, struct sockaddr *sa, int *newfd, const struct cmdLineOpts *opts) {
@@ -1087,6 +1096,8 @@ matchAllAddr(const struct mapping *map, struct sockaddr *sa, int *newfd, const s
                     get_ip_str(sa, addr1, sizeof(addr1)),
                     get_ip_str(map->addr, addr2, sizeof(addr2)), map->prefix,
                     map->replacement_fd);
+            // FIXME: handle the case where the bind should be blocked, and the
+            // replaced address is empty
         }
         if(matchAddr(map, sa, opts)) {
             if(map->replacement) {

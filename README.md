@@ -36,15 +36,26 @@ This is still a young project. Don't hesitate to report bugs or submit fixes.
 Known bugs
 ----------
 
-- parent process always exits with status 0 in seccomp-only mode
+- parent process always exits with status 0 in seccomp-only mode (seccomp daemon
+  should pass exit status to parent process)
 - if the process close a systemd activated socket and opens a new socket on the
   same file descriptor number that is not catched by force-bind, then the
   subsequent listen() calls will be skipped
 - security issue: race condition when replacing the network address causing a
-  malicious program to bind an otherwise forbidden address.
+  malicious program to bind an otherwise forbidden address. Can be solved with
+  pidfd_getfd.
 - When the file descriptors are not passed by systemd (the service is started
   while the socket was not active for example), force-bind should let the
   process bind() and listen() normally
+
+TODO:
+
+- Use pidfd_getfd to implement bind properly on the seccomp agent side instead
+  of patching memory of the target process.
+- Allow to bind to hostnames which can resolve to multiple IP addresses which is
+  made possible by pidfd_getfd. `getaddrinfo2()` results should be checked for a
+  next address in `res->ai_next`.
+- Allot to block a find matching a specific address.
 
 History
 -------
@@ -143,11 +154,19 @@ Test
     nc -u 127.0.0.1 8888
 
 
+Requirements
+------------
+
+- [Linux 5.0](https://man7.org/tlpi/api_changes/index.html#Linux-5.0) (2019-03-03) for SECCOMP_RET_USER_NOTIF
+- [Linux 5.6](https://man7.org/tlpi/api_changes/index.html#Linux-5.6) (2020-03-29) for pidfd_getfd (not used yet here, can be used to replace ptrace)
+- [Linux 5.9](https://man7.org/tlpi/api_changes/index.html#Linux-5.9) (2020-10-11) for SECCOMP_IOCTL_NOTIF_ADDFD (not used yet here, can be used to correctly install systemd socket activation file descriptors)
+
 Reference
 ---------
 
 In random order:
 
+- https://man7.org/tlpi/api_changes/index.html
 - https://people.kernel.org/brauner/the-seccomp-notifier-new-frontiers-in-unprivileged-container-development
 - https://nullprogram.com/blog/2018/06/23/
 - https://github.com/alfonsosanchezbeato/ptrace-redirect
