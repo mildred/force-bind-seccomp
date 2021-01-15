@@ -857,7 +857,7 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
         printf("parse map %s %s %s\n", matchaddr, prefix, replace);
     }
 
-    if(matchaddr && *matchaddr && matchaddr[0] != ':' && !prefix){
+    if(matchaddr && *matchaddr && matchaddr[0] != ':'){
         err = getaddrinfo2(matchaddr, &hints, &res);
         if(err) {
             fprintf(stderr, "Cannot parse match %s: %s\n", matchaddr, strerror(err));
@@ -865,6 +865,11 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
         }
         cur->addr = copyAddr(res); // FIXME: handle ai_next
         freeaddrinfo(res);
+        if(opts->debug) {
+            char addr[PATH_MAX];
+            printf("parsed map address %s\n",
+                get_ip_str(cur->addr, addr, sizeof(addr)));
+        }
     }
 
     if(replace && *replace){
@@ -874,12 +879,14 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
             cur->replacement_fd = fd;
             cur->replacement = NULL;
             opts->require_ptrace = true;
+            if(opts->debug) printf("parsed replacement fd %d\n", cur->replacement_fd);
         } else if (len > 3 && replace[0] == 's' && replace[1] == 'd' && (replace[2] == '=' || replace[2] == '-')) {
             int sd = atoi(&replace[3]);
             int fd = sd + 3;
             cur->replacement_fd = fd;
             cur->replacement = NULL;
             opts->require_ptrace = true;
+            if(opts->debug) printf("parsed replacement fd %d (systemd)\n", cur->replacement_fd);
         } else {
             err = getaddrinfo2(replace, &hints, &res);
             if(err) {
@@ -889,6 +896,10 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
             cur->replacement = copyAddr(res); // FIXME: handle ai_next
             cur->replacement_fd = 0;
             freeaddrinfo(res);
+            if(opts->debug) {
+                char addr[PATH_MAX];
+                printf("parsed replacement address %s\n", get_ip_str(cur->replacement, addr, sizeof(addr)));
+            }
         }
     }
 
@@ -906,9 +917,17 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
                 exit(EXIT_FAILURE);
             }
             cur->addr = copyAddr(res);
-            cur->prefix = 32;
+            if(prefix) {
+                cur->prefix = atoi(prefix);
+            } else {
+                cur->prefix = 32;
+            }
             freeaddrinfo(res);
             num++;
+            if(opts->debug) {
+                char addr[PATH_MAX];
+                printf("parsed map address %s CIDR %d\n", get_ip_str(cur->addr, addr, sizeof(addr)), cur->prefix);
+            }
         }
 
         if(!cur->replacement || cur->replacement->sa_family == AF_INET6) {
@@ -928,9 +947,17 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
                 exit(EXIT_FAILURE);
             }
             cur->addr = copyAddr(res);
-            cur->prefix = 128;
+            if(prefix) {
+                cur->prefix = atoi(prefix);
+            } else {
+                cur->prefix = 128;
+            }
             freeaddrinfo(res);
             num++;
+            if(opts->debug) {
+                char addr[PATH_MAX];
+                printf("parsed map address %s CIDR %d\n", get_ip_str(cur->addr, addr, sizeof(addr)), cur->prefix);
+            }
         }
 
     } else {
@@ -941,6 +968,11 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
             cur->prefix = 32;
         } else if (cur->addr && cur->addr->sa_family == AF_INET6) {
             cur->prefix = 128;
+        }
+
+        if(opts->debug) {
+            char addr[PATH_MAX];
+            printf("parsed map address %s CIDR %d\n", get_ip_str(cur->addr, addr, sizeof(addr)), cur->prefix);
         }
 
 
