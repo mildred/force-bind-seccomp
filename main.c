@@ -1133,9 +1133,11 @@ matchAllAddr(const struct mapping *map, struct sockaddr *sa, int *newfd, const s
         }
         if(matchAddr(map, sa, opts)) {
             if(map->replacement) {
+                if(opts->verbose) printf("force-bind: matched IP replacement\n");
                 setReplacement(sa, map->replacement);
                 return 1;
             } else if (map->replacement_fd) {
+                if(opts->verbose) printf("force-bind: matched file descriptor\n");
                 *newfd = map->replacement_fd;
                 return 2;
             } else {

@@ -160,12 +160,15 @@ Requirements
 - [Linux 5.0](https://man7.org/tlpi/api_changes/index.html#Linux-5.0) (2019-03-03) for SECCOMP_RET_USER_NOTIF
 - [Linux 5.6](https://man7.org/tlpi/api_changes/index.html#Linux-5.6) (2020-03-29) for pidfd_getfd (not used yet here, can be used to replace ptrace)
 - [Linux 5.9](https://man7.org/tlpi/api_changes/index.html#Linux-5.9) (2020-10-11) for SECCOMP_IOCTL_NOTIF_ADDFD (not used yet here, can be used to correctly install systemd socket activation file descriptors)
+- Linux 5.10 for BPF sk_lokup
 
 Reference
 ---------
 
 In random order:
 
+- https://www.kernel.org/doc/html/latest/bpf/prog_sk_lookup.html
+- https://blog.cloudflare.com/its-crowded-in-here/
 - https://man7.org/tlpi/api_changes/index.html
 - https://people.kernel.org/brauner/the-seccomp-notifier-new-frontiers-in-unprivileged-container-development
 - https://nullprogram.com/blog/2018/06/23/
