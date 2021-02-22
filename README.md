@@ -1,7 +1,7 @@
 force-bind-seccomp
 ==================
 
-Use seccomp to foce processes to bind to specific address instead of binding to
+Use seccomp to force processes to bind to specific address instead of binding to
 `0.0.0.0` (IPv4) or `[::]` (IPv6). It can also transform a process that does not
 make use of systemd socket activation to use passed file descriptor instead of
 binding their own sockets.
