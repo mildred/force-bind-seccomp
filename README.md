@@ -15,10 +15,13 @@ Under the hood, it works in two ways:
 
   It uses `SECCOMP_RET_USER_NOTIF` which is only available on recent kernels.
 
-- if systemd socket activation is needed, then it uses seccomp in combinaison
-  with ptrace and when a `bind()` system call is detected, then the process is
-  stopped and ptrace is used to alter the process. The system call registers are
-  dumped and if the address bound matches a pattern:
+  If systemd socket activation is needed, then it uses
+  `SECCOMP_IOCTL_NOTIF_ADDFD` which is even newer.
+
+- if `-p` flag is specified, then it uses seccomp in combinaison with ptrace and
+  when a `bind()` system call is detected, then the process is stopped and
+  ptrace is used to alter the process. The system call registers are dumped and
+  if the address bound matches a pattern:
 
     - either ptrace is used to replace the address with a replacement address,
       just like with seccomp, and the bind system call continues
@@ -26,10 +29,6 @@ Under the hood, it works in two ways:
     - if systemd socket activation is needed for that pattern, then the system
       call is replaced by the `dup2()` system call and the return value is
       altered to return `0` in case of success.
-
-In the future, when `SECCOMP_NOTIFY_IOCTL_ADDFD` will become available, then
-ptrace could be entirely replaced by seccomp, including when systemd socket
-activation is needed.
 
 This is still a young project. Don't hesitate to report bugs or submit fixes.
 

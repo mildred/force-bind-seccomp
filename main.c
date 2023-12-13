@@ -106,6 +106,12 @@ seccomp(unsigned int operation, unsigned int flags, void *args)
     return syscall(__NR_seccomp, operation, flags, args);
 }
 
+struct replaced_fds;
+struct replaced_fds {
+    int                  fd;
+    struct replaced_fds *next;
+};
+
 /* Values from command-line options */
 
 struct mapping;
@@ -161,6 +167,11 @@ installNotifyFilter(void)
         /* bind() triggers notification to user-space tracer */
 
         BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_bind, 0, 1),
+        BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_USER_NOTIF),
+
+        /* listen() triggers notification to user-space tracer */
+
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_listen, 0, 1),
         BPF_STMT(BPF_RET + BPF_K, SECCOMP_RET_USER_NOTIF),
 
         /* Every other system call is allowed */
@@ -341,6 +352,7 @@ checkNotificationIdIsValid(int notifyFd, __u64 id, char *tag, struct cmdLineOpts
 static void
 watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
 {
+    struct replaced_fds *replaced_fds = NULL;
     struct seccomp_notif *req;
     struct seccomp_notif_resp *resp;
     struct seccomp_notif_sizes sizes;
@@ -367,204 +379,269 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
     /* Loop handling notifications */
 
     for (;;) {
-        /* Wait for next notification, returning info in '*req' */
+      /* Wait for next notification, returning info in '*req' */
 
-        bzero(req, sizes.seccomp_notif);
-        bzero(resp, sizes.seccomp_notif_resp);
+      bzero(req, sizes.seccomp_notif);
+      bzero(resp, sizes.seccomp_notif_resp);
 
-        if (ioctl(notifyFd, SECCOMP_IOCTL_NOTIF_RECV, req) == -1)
-            errExit("Tracer: ioctlSECCOMP_IOCTL_NOTIF_RECV");
+      if(opts->debug) printf("Tracer: wait for user notification\n");
+      if (ioctl(notifyFd, SECCOMP_IOCTL_NOTIF_RECV, req) == -1)
+          errExit("Tracer: ioctlSECCOMP_IOCTL_NOTIF_RECV");
+      if(opts->debug) printf("Tracer: received notification syscall=%d\n", req->data.nr);
 
-        if(opts->debug) printf("Tracer: got notification for PID %d; ID is %llx\n",
-                req->pid, req->id);
+      switch(req->data.nr) {
+          default:
+              fprintf(stderr, "seccomp: got unexpected syscall %d", req->data.nr);
+              exit(EXIT_FAILURE);
 
-        /* Access the memory of the target process in order to discover
-           the syscall arguments */
+          case __NR_listen: {
 
-        snprintf(path, sizeof(path), "/proc/%d/mem", req->pid);
+              int fd = req->data.args[0];
 
-        procMem = open(path, O_RDWR);
-        if (procMem == -1)
-            errExit("Tracer: open");
+              // Check if the file descriptor was replaced
+              struct replaced_fds *rfd = replaced_fds;
+              while(rfd) {
+                  if(rfd->fd == fd) break;
+                  rfd = rfd->next;
+              }
 
-        /* Check that the process whose info we are accessing is still alive */
+              resp->id = req->id;
+              resp->flags = 0;        /* Must be zero as at Linux 5.0 */
+              resp->val = 0;          /* Success return value is 0 */
+              resp->error = 0;
+              resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
 
-        checkNotificationIdIsValid(notifyFd, req->id, "post-open", opts);
+              if(rfd) {
+                  // Ignore syscall
+                  resp->flags = 0;
+                  if(opts->verbose) printf("force-bind: ignore listen(%d, %d)\n", req->data.args[0], req->data.args[1]);
+              } else {
+                  if(opts->debug) printf("Tracer: interepted but do not prevent listen(%d, %d)\n", req->data.args[0], req->data.args[1]);
+              }
+              break;
+          }
+          case __NR_bind: {
 
-        /* Since, the SECCOMP_IOCTL_NOTIF_ID_VALID operation (performed in
-           checkNotificationIdIsValid()) succeeded, we know that the
-           /proc/PID/mem file descriptor that we opened corresponded to the
-           process for which we received a notification. If that process
-           subsequently terminates, then read() on that file descriptor will
-           return 0 (EOF). This can be tested by (1) uncommenting the sleep()
-           call below (and rebuilding the program); (2) running the program
-           with flags to ensure that the tracer is not killed if the target
-           dies; and (3) killing the target process during the sleep(). */
+              if(opts->debug) printf("Tracer: got notification for PID %d; ID is %llx\n",
+                  req->pid, req->id);
 
-        // if(opts->debug) printf("About to sleep in target\n");
-        // sleep(15);
+              /* Access the memory of the target process in order to discover
+                 the syscall arguments */
 
-        /* Seek to the location containing the pathname argument (i.e., the
-           first argument) of the mkdir(2) call and read that pathname */
+              snprintf(path, sizeof(path), "/proc/%d/mem", req->pid);
 
-        int socketfd = req->data.args[0];
-        intptr_t addrptr = req->data.args[1];
-        size_t addrlen = req->data.args[2];
-        if(opts->debug) printf("Tracer: bind(%d, 0x%llx, %lld, %lld, %lld, %llx)\n", socketfd, addrptr, addrlen, req->data.args[3], req->data.args[4], req->data.args[5]);
+              procMem = open(path, O_RDWR);
+              if (procMem == -1)
+                errExit("Tracer: open");
 
-        if (lseek(procMem, addrptr, SEEK_SET) == -1)
-            errExit("Tracer: lseek");
+              /* Check that the process whose info we are accessing is still alive */
 
-        addr = malloc(addrlen);
-        if (resp == NULL)
-            errExit("Tracer: malloc");
+              checkNotificationIdIsValid(notifyFd, req->id, "post-open", opts);
 
-        ssize_t s = read(procMem, addr, addrlen);
-        if (s == -1)
-            errExit("read");
-        else if (s == 0) {
-            if(opts->debug) fprintf(stderr, "Tracer: read returned EOF\n");
-            exit(EXIT_FAILURE);
-        }
+              /* Since, the SECCOMP_IOCTL_NOTIF_ID_VALID operation (performed in
+                 checkNotificationIdIsValid()) succeeded, we know that the
+                 /proc/PID/mem file descriptor that we opened corresponded to the
+                 process for which we received a notification. If that process
+                 subsequently terminates, then read() on that file descriptor will
+                 return 0 (EOF). This can be tested by (1) uncommenting the sleep()
+                 call below (and rebuilding the program); (2) running the program
+                 with flags to ensure that the tracer is not killed if the target
+                 dies; and (3) killing the target process during the sleep(). */
 
-        char addrstring[PATH_MAX];
-        if(opts->debug) {
-            printf("Tracer: %p = %s\n", (void*) addrptr,
-                    get_ip_str(addr, addrstring, sizeof(addrstring)));
-            for(int i = 0; i < addrlen; ++i) {
-                if(i == 0) printf("Tracer bind addr:");
-                printf(" %02x", ((char*) addr)[i]);
-                if(i == addrlen - 1) printf("\n");
-            }
-        }
+              // if(opts->debug) printf("About to sleep in target\n");
+              // sleep(15);
 
-        if(opts->debug) printf("Tracer: bind(%d, %s)\n", socketfd, get_ip_str(addr, addrstring, sizeof(addrstring)));
+              /* Seek to the location containing the pathname argument (i.e., the
+                 first argument) of the mkdir(2) call and read that pathname */
 
-        /* The response to the notification includes the notification ID */
+              int socketfd = req->data.args[0];
+              intptr_t addrptr = req->data.args[1];
+              size_t addrlen = req->data.args[2];
+              if(opts->debug) printf("Tracer: bind(%d, 0x%llx, %lld, %lld, %lld, %llx)\n", socketfd, addrptr, addrlen, req->data.args[3], req->data.args[4], req->data.args[5]);
 
-        resp->id = req->id;
-        resp->flags = 0;        /* Must be zero as at Linux 5.0 */
-        resp->val = 0;          /* Success return value is 0 */
-        resp->error = 0;
+              if (lseek(procMem, addrptr, SEEK_SET) == -1)
+                errExit("Tracer: lseek");
 
-        if (addr->sa_family != AF_INET && addr->sa_family != AF_INET6) {
-
-            /* Continue the syscall. This is not secure at all, but we don't
-             * care for now */
-
-            resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
-
-        } else {
-
-            /* Continue the syscall. ideally we should filter the IP address and
-             * make sure it is allowed, but this is not yet implemented */
-
-            // use ptrace (most secure) https://github.com/briceburg/fdclose/blob/master/src/ptrace_do/libptrace_do.c
-            // (but will that call seccomp recursively ???)
-            // or modify process memory and return with SECCOMP_USER_NOTIF_FLAG_CONTINUE
-
-            /*
-            snprintf(path, sizeof(path), "/proc/%d/fd/%d", req->pid, socketfd);
-
-            int sock = open(path, 0);
-            if (sock == -1)
-                errExit("Tracer: open(sock)");
-
-            resp->error = bind(sock, addr, addrlen);
-
-            if(opts->debug) printf("Tracer: bind() = %d", resp->error);
-            */
-
-            resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
-
-            struct sockaddr *replacement = malloc(addrlen);
-            if (replacement == NULL)
+              addr = malloc(addrlen);
+              if (resp == NULL)
                 errExit("Tracer: malloc");
-            memcpy(replacement, addr, addrlen);
 
-            int newfd;
-            // FIXME: handle multiple replacement
-            int matchres = matchAllAddr(opts->map, replacement, &newfd, opts);
-            if(matchres < 0) {
-                resp->flags = 0;
-                resp->error = -matchres;
-            } else if(matchres == 2) {
-                resp->flags = 0;
-                resp->error = -EINVAL;
-            } else if(matchres == 1) {
-                char repladdrstring[PATH_MAX];
-                if(!opts->quiet) printf("force-bind: replace %s with %s\n",
-                        get_ip_str(addr, addrstring, sizeof(addrstring)),
-                        get_ip_str(replacement, repladdrstring, sizeof(repladdrstring)));
+              ssize_t s = read(procMem, addr, addrlen);
+              if (s == -1)
+                errExit("read");
+              else if (s == 0) {
+                if(opts->debug) fprintf(stderr, "Tracer: read returned EOF\n");
+                exit(EXIT_FAILURE);
+              }
 
-                if (lseek(procMem, addrptr, SEEK_SET) == -1)
+              char addrstring[PATH_MAX];
+              if(opts->debug) {
+                printf("Tracer: %p = %s\n", (void*) addrptr,
+                    get_ip_str(addr, addrstring, sizeof(addrstring)));
+                for(int i = 0; i < addrlen; ++i) {
+                  if(i == 0) printf("Tracer bind addr: %p = ", addr);
+                  printf(" %02x", ((char*) addr)[i]);
+                  if(i == addrlen - 1) printf("\n");
+                }
+              }
+
+              if(opts->debug) printf("Tracer: bind(%d, %s)\n", socketfd, get_ip_str(addr, addrstring, sizeof(addrstring)));
+
+              /* The response to the notification includes the notification ID */
+
+              resp->id = req->id;
+              resp->flags = 0;        /* Must be zero as at Linux 5.0 */
+              resp->val = 0;          /* Success return value is 0 */
+              resp->error = 0;
+
+              if (addr->sa_family != AF_INET && addr->sa_family != AF_INET6) {
+
+                /* In this branch, the bind() syscall was performed on addresses
+                 * that are neither INET nor INET6, don't alter */
+
+                /* Continue the syscall. This is not secure at all, but we don't
+                 * care for now */
+
+                resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+
+              } else {
+
+                /* In this branch, the bind() syscall was performed on INET or
+                 * INET6 addresses */
+
+                /* Continue the syscall. ideally we should filter the IP address and
+                 * make sure it is allowed, but this is not yet implemented */
+
+                // use ptrace (most secure) https://github.com/briceburg/fdclose/blob/master/src/ptrace_do/libptrace_do.c
+                // (but will that call seccomp recursively ???)
+                // or modify process memory and return with SECCOMP_USER_NOTIF_FLAG_CONTINUE
+
+                /*
+                   snprintf(path, sizeof(path), "/proc/%d/fd/%d", req->pid, socketfd);
+
+                   int sock = open(path, 0);
+                   if (sock == -1)
+                   errExit("Tracer: open(sock)");
+
+                   resp->error = bind(sock, addr, addrlen);
+
+                   if(opts->debug) printf("Tracer: bind() = %d", resp->error);
+                   */
+
+                resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+
+                struct sockaddr *replacement = malloc(addrlen);
+                if (replacement == NULL)
+                  errExit("Tracer: malloc");
+                memcpy(replacement, addr, addrlen);
+
+                int newfd;
+                // FIXME: handle multiple replacement
+                int matchres = matchAllAddr(opts->map, replacement, &newfd, opts);
+                if(matchres < 0) {
+                  resp->flags = 0;
+                  resp->error = -matchres;
+                } else if(matchres == 2) {
+                  struct seccomp_notif_addfd addfd;
+                  addfd.id = req->id; /* Cookie from SECCOMP_IOCTL_NOTIF_RECV */
+                  addfd.srcfd = newfd;
+                  addfd.newfd = socketfd;
+                  addfd.flags = SECCOMP_ADDFD_FLAG_SETFD;
+                  addfd.newfd_flags = 0;
+                  int targetFd = ioctl(notifyFd, SECCOMP_IOCTL_NOTIF_ADDFD, &addfd);
+
+                  if(opts->debug) fprintf(stderr, "Tracer: %d file descriptor sent as %d (= %d)\n", newfd, targetFd, socketfd);
+
+                  struct replaced_fds *replace_fd = malloc(sizeof(struct replaced_fds));
+                  if (replace_fd == NULL) {
+                      fprintf(stderr, "force-bind: malloc failed\n");
+                  } else {
+                      bzero(replace_fd, sizeof(struct replaced_fds));
+                      replace_fd->next = replaced_fds;
+                      replace_fd->fd = targetFd;
+                      replaced_fds = replace_fd;
+                  }
+
+                  resp->flags = 0;
+                  resp->error = (targetFd < 0) ? -errno : 0;
+                  resp->val   = targetFd;
+                } else if(matchres == 1) {
+                  char repladdrstring[PATH_MAX];
+                  if(!opts->quiet) printf("force-bind: replace %s with %s\n",
+                      get_ip_str(addr, addrstring, sizeof(addrstring)),
+                      get_ip_str(replacement, repladdrstring, sizeof(repladdrstring)));
+
+                  if (lseek(procMem, addrptr, SEEK_SET) == -1)
                     errExit("force-bind: lseek");
 
-                if(opts->debug) {
+                  if(opts->debug) {
                     for(int i = 0; i < addrlen; ++i) {
-                        if(i == 0) printf("Tracer write addr:");
-                        printf(" %02x", ((char*) replacement)[i]);
-                        if(i == addrlen - 1) printf("\n");
+                      if(i == 0) printf("Tracer write addr:");
+                      printf(" %02x", ((char*) replacement)[i]);
+                      if(i == addrlen - 1) printf("\n");
                     }
-                }
+                  }
 
-                ssize_t s = write(procMem, replacement, addrlen);
-                if (s == -1)
+                  ssize_t s = write(procMem, replacement, addrlen);
+                  if (s == -1)
                     errExit("read");
-                else if (s != addrlen) {
+                  else if (s != addrlen) {
                     fprintf(stderr, "force-bind: short write\n");
                     exit(EXIT_FAILURE);
-                }
+                  }
 
-                if(opts->debug) {
+                  if(opts->debug) {
 
                     if (lseek(procMem, addrptr, SEEK_SET) == -1)
-                        errExit("Tracer: lseek");
+                      errExit("Tracer: lseek");
 
                     free(addr);
                     addr = malloc(addrlen);
                     if (resp == NULL)
-                        errExit("Tracer: malloc");
+                      errExit("Tracer: malloc");
 
                     ssize_t s = read(procMem, addr, addrlen);
                     if (s == -1)
-                        errExit("read");
+                      errExit("read");
                     else if (s == 0) {
-                        if(opts->debug) fprintf(stderr, "Tracer: read returned EOF\n");
-                        exit(EXIT_FAILURE);
+                      if(opts->debug) fprintf(stderr, "Tracer: read returned EOF\n");
+                      exit(EXIT_FAILURE);
                     }
 
                     printf("Tracer: %p = %s\n", (void*) addrptr,
-                            get_ip_str(addr, addrstring, sizeof(addrstring)));
+                        get_ip_str(addr, addrstring, sizeof(addrstring)));
 
                     for(int i = 0; i < addrlen; ++i) {
-                        if(i == 0) printf("Tracer bind addr:");
-                        printf(" %02x", ((char*) addr)[i]);
-                        if(i == addrlen - 1) printf("\n");
+                      if(i == 0) printf("Tracer bind addr:");
+                      printf(" %02x", ((char*) addr)[i]);
+                      if(i == addrlen - 1) printf("\n");
                     }
+                  }
+
+                  free(replacement);
                 }
 
-                free(replacement);
+              }
+
+              free(addr);
+
+              if (close(procMem) == -1)
+                errExit("close-/proc/PID/mem");
+              break;
             }
-
         }
-
-        free(addr);
-
-        if (close(procMem) == -1)
-            errExit("close-/proc/PID/mem");
 
         /* Provide a response to the target process */
 
         if (ioctl(notifyFd, SECCOMP_IOCTL_NOTIF_SEND, resp) == -1) {
-            if (errno == ENOENT) {
-                if(opts->debug) printf("Tracer: response failed with ENOENT; perhaps target "
-                        "process's syscall was interrupted by signal?\n");
-            } else {
-                perror("ioctl-SECCOMP_IOCTL_NOTIF_SEND");
-            }
+          if (errno == ENOENT) {
+            if(opts->debug) printf("Tracer: response failed with ENOENT; perhaps target "
+                "process's syscall was interrupted by signal?\n");
+          } else {
+            perror("ioctl-SECCOMP_IOCTL_NOTIF_SEND");
+          }
         }
-        if(opts->debug) printf("Tracer: notification sent.\n");
+        if(opts->debug) printf("Tracer: notification sent res=%d, errno=%d flags=%d.\n", resp->val, -resp->error, resp->flags);
     }
 }
 
@@ -602,6 +679,8 @@ tracerProcess(int sockPair[2], struct cmdLineOpts *opts)
     /* Handle notifications */
 
     watchForNotifications(notifyFd, opts);
+    
+    if(opts->debug) printf("Tracer: exit\n");
 
     exit(EXIT_SUCCESS);         /* NOTREACHED */
 }
@@ -704,12 +783,6 @@ static bool ptrace_put_bind_args(pid_t target, struct user_regs_struct *regs, in
     }
     return true;
 }
-
-struct replaced_fds;
-struct replaced_fds {
-    int                  fd;
-    struct replaced_fds *next;
-};
 
 static int
 process_ptrace(pid_t target, struct cmdLineOpts *opts) {
@@ -897,14 +970,14 @@ parseMap(const char *map0, struct mapping *next, struct cmdLineOpts *opts, bool 
             int fd = atoi(&replace[3]);
             cur->replacement_fd = fd;
             cur->replacement = NULL;
-            opts->require_ptrace = true;
+            //opts->require_ptrace = true;
             if(opts->debug) printf("parsed replacement fd %d\n", cur->replacement_fd);
         } else if (len > 3 && replace[0] == 's' && replace[1] == 'd' && (replace[2] == '=' || replace[2] == '-')) {
             int sd = atoi(&replace[3]);
             int fd = sd + 3;
             cur->replacement_fd = fd;
             cur->replacement = NULL;
-            opts->require_ptrace = true;
+            //opts->require_ptrace = true;
             if(opts->debug) printf("parsed replacement fd %d (systemd)\n", cur->replacement_fd);
         } else {
             err = getaddrinfo2(replace, &hints, &res);

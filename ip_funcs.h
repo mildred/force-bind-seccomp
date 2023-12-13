@@ -3,6 +3,7 @@
 
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <netdb.h>
 
 
@@ -49,14 +50,24 @@ get_ip_str(const struct sockaddr *sa, char *s, size_t maxlen)
 {
 #define sa4 ((struct sockaddr_in *)sa)
 #define sa6 ((struct sockaddr_in6 *)sa)
+#define sun ((struct sockaddr_un *)sa)
     char addr[1024];
 
     if(!sa) {
-        strncpy(s, "(null)", maxlen);
+        strncpy(s, "(nullptr)", maxlen);
         return s;
     }
 
     switch(sa->sa_family) {
+        case AF_UNIX: {
+            if (sun->sun_path[0] == 0) {
+                snprintf(s, maxlen, "\"\\0%s\"", &sun->sun_path[1]);
+            } else {
+                snprintf(s, maxlen, "\"%s\"", sun->sun_path);
+            }
+            break;
+        }
+
         case AF_INET: {
             inet_ntop(AF_INET, &(sa4->sin_addr), addr, sizeof(addr));
             snprintf(s, maxlen, "%s:%d", addr, ntohs(sa4->sin_port));
@@ -69,12 +80,14 @@ get_ip_str(const struct sockaddr *sa, char *s, size_t maxlen)
             break;
 
         default:
-            return NULL;
+            snprintf(s, maxlen, "(family=%d)", sa->sa_family);
+            break;
     }
 
     return s;
 #undef sa4
 #undef sa6
+#undef sun
 }
 
 #endif
