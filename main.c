@@ -87,6 +87,14 @@
 #include <netdb.h>
 #include "scm_functions.h"
 
+#ifdef __x86_64__
+#define SC_NUMBER  (8 * ORIG_RAX)
+#define SC_RETCODE (8 * RAX)
+#else
+#define SC_NUMBER  (4 * ORIG_EAX)
+#define SC_RETCODE (4 * EAX)
+#endif
+
 #include "ip_funcs.h"
 
 #define errExit(msg)    do { perror(msg); exit(EXIT_FAILURE); \
@@ -138,7 +146,7 @@ static int matchAllAddr(const struct mapping *map, struct sockaddr *sa, int *new
         BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS)
 
 /* installNotifyFilter() installs a seccomp filter that generates user-space
-   notifications (SECCOMP_RET_USER_NOTIF) when the process calls mkdir(2); the
+   notifications (SECCOMP_RET_USER_NOTIF) when the process calls bind(2); the
    filter allows all other system calls.
 
    The function return value is a file descriptor from which the user-space
@@ -607,8 +615,19 @@ wait_for_ptrace(pid_t target, int *res_status, struct cmdLineOpts *opts){
         waitpid(target, &status, 0);
         if(opts->debug) printf("Tracer: [waitpid status: 0x%08x]\n", status);
         /* Is it our filter for the open syscall? */
-        if (status >> 8 == (SIGTRAP | (PTRACE_EVENT_SECCOMP << 8)))
+        if (WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP && status >> 8 == (SIGTRAP | (PTRACE_EVENT_SECCOMP << 8))) {
+            /* Note that there are *three* reasons why the child might stop
+             * with SIGTRAP:
+             *  1) syscall entry
+             *  2) syscall exit
+             *  3) child calls exec
+             *  <https://stackoverflow.com/a/7522990>
+             */
+            long sc_number = ptrace(PTRACE_PEEKUSER, target, SC_NUMBER, NULL);
+            long sc_retcode = ptrace(PTRACE_PEEKUSER, target, SC_RETCODE, NULL);
+            if(opts->debug) printf("Tracer: SIGTRAP syscall %ld, rc = %ld\n", sc_number, sc_retcode);
             return 0;
+        }
         if (WIFEXITED(status)) {
             if(res_status) *res_status = status;
             return 1;

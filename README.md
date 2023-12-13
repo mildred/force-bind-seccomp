@@ -36,6 +36,7 @@ This is still a young project. Don't hesitate to report bugs or submit fixes.
 Known bugs
 ----------
 
+- ptrace can mess up and can make syscalls return -ENOSYS (no implemented)
 - parent process always exits with status 0 in seccomp-only mode (seccomp daemon
   should pass exit status to parent process)
 - if the process close a systemd activated socket and opens a new socket on the
