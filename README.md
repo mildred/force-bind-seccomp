@@ -35,16 +35,17 @@ This is still a young project. Don't hesitate to report bugs or submit fixes.
 Known bugs
 ----------
 
-- ptrace can mess up and can make syscalls return -ENOSYS (no implemented)
-- if the process close a systemd activated socket and opens a new socket on the
-  same file descriptor number that is not catched by force-bind, then the
-  subsequent listen() calls will be skipped
-- security issue: the target process could bypass the force-bind policy using a
-  race condition when replacing the network address. If timed correctly, it can
-  bind an otherwise forbidden address. Can be solved with pidfd_getfd.
 - When the file descriptors are not passed by systemd (the service is started
   while the socket was not active for example), force-bind should let the
   process bind() and listen() normally
+- security issue: the target process could bypass the force-bind policy using a
+  race condition when replacing the network address. If timed correctly, it can
+  bind an otherwise forbidden address. Can be solved with pidfd_getfd.
+- when using `-L` flag and if the process close a systemd activated socket and
+  opens a new socket on the same file descriptor number that is not catched by
+  force-bind, then the subsequent listen() calls will be skipped
+- ptrace can mess up and can make syscalls return -ENOSYS (no implemented).
+  Workaround is not to use `-p` flag and rely on seccomp user notif instead.
 
 TODO:
 

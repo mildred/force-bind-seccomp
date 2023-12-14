@@ -126,6 +126,7 @@ struct mapping {
 
 struct cmdLineOpts {
     bool require_ptrace;
+    bool prevent_listen;
     bool debug;
     bool quiet;
     bool verbose;
@@ -411,7 +412,7 @@ watchForNotifications(int notifyFd, struct cmdLineOpts *opts)
               resp->error = 0;
               resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
 
-              if(rfd) {
+              if(opts->prevent_listen && rfd) {
                   // Ignore syscall
                   resp->flags = 0;
                   if(opts->verbose) printf("force-bind: ignore listen(%d, %d)\n", req->data.args[0], req->data.args[1]);
@@ -880,7 +881,7 @@ process_ptrace(pid_t target, struct cmdLineOpts *opts) {
                         if(rfd->fd == fd) break;
                         rfd = rfd->next;
                     }
-                    if(rfd) {
+                    if(opts->prevent_listen && rfd) {
                         // ignore listen syscall
                         if(opts->debug) printf("Tracer: listen(%d, %d), ignoring\n", fd, regs.rsi);
                         // first change syscall number to -1 (invalid) and run
@@ -1260,10 +1261,12 @@ usageError(char *msg, char *pname)
         "    -m MATCH=ADDR         Replace bind() matching first MATCH with ADDR\n"
         "    -b ADDR               Replace all bind() with ADDR (if same family)\n"
         "    -d                    Deny all bind()\n"
-        "    -p                    Force seccomp-ptrace instead of only seccomp\n"
         "    -D                    Debug messages\n"
         "    -v                    Verbose\n"
         "    -q                    Quiet\n"
+        "    -L                    Block listen(2) for fd-N or sd-N sockets\n"
+        "    -p                    Force seccomp-ptrace instead of seccomp user notif\n"
+        "                          (might not work very well)\n"
         "\n"
         "Last rules (-m, -b, -d) are applied first so you can put your general policy\n"
         "first on your command-line and any following argument can override it.\n"
@@ -1304,6 +1307,14 @@ usageError(char *msg, char *pname)
         "\n"
         "    Replace any bind to port 80 using first socket from systemd socket\n"
         "    activation. Any port 81 is replaced by passed file descriptor 4.\n"
+        "\n"
+        "Limitations:\n"
+        "\n"
+        "    When replacing a socket with an existing file descriptor (by fd number\n"
+        "    or using systemd socket activation) and -L flag is used, then all\n"
+        "    listen() syscalls on that file descriptor will be ignored. Than can\n"
+        "    cause bugs if the file descriptor number is reused (listen calls will\n"
+        "    still be blocked).\n"
         "\n");
 #ifdef VERSION
     fprintf(stderr, "\nVersion: %s\n", VERSION);
@@ -1321,6 +1332,7 @@ parseCommandLineOptions(int argc, char *argv[], struct cmdLineOpts *opts)
     opts->debug = false;
     opts->map = NULL;
     opts->require_ptrace = false;
+    opts->prevent_listen = false;
 
     int i;
     for(i = 1; argv[i]; i++){
@@ -1333,6 +1345,9 @@ parseCommandLineOptions(int argc, char *argv[], struct cmdLineOpts *opts)
 
         } else if(!strcmp("-d", arg)) {              /* Deny */
             opts->map = parseMap(NULL, opts->map, opts, false);
+
+        } else if(!strcmp("-L", arg)) {              /* block listen */
+            opts->prevent_listen = true;
 
         } else if(!strcmp("-p", arg)) {              /* Ptrace */
             opts->require_ptrace = true;
