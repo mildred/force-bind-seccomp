@@ -36,14 +36,12 @@ Known bugs
 ----------
 
 - ptrace can mess up and can make syscalls return -ENOSYS (no implemented)
-- parent process always exits with status 0 in seccomp-only mode (seccomp daemon
-  should pass exit status to parent process)
 - if the process close a systemd activated socket and opens a new socket on the
   same file descriptor number that is not catched by force-bind, then the
   subsequent listen() calls will be skipped
-- security issue: race condition when replacing the network address causing a
-  malicious program to bind an otherwise forbidden address. Can be solved with
-  pidfd_getfd.
+- security issue: the target process could bypass the force-bind policy using a
+  race condition when replacing the network address. If timed correctly, it can
+  bind an otherwise forbidden address. Can be solved with pidfd_getfd.
 - When the file descriptors are not passed by systemd (the service is started
   while the socket was not active for example), force-bind should let the
   process bind() and listen() normally
@@ -55,7 +53,7 @@ TODO:
 - Allow to bind to hostnames which can resolve to multiple IP addresses which is
   made possible by pidfd_getfd. `getaddrinfo2()` results should be checked for a
   next address in `res->ai_next`.
-- Allot to block a find matching a specific address.
+- Allow to block a find matching a specific address.
 
 History
 -------

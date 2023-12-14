@@ -1399,8 +1399,7 @@ main(int argc, char *argv[])
 
     /* Create a child process--the "target"--that installs seccomp filtering.
        The target process writes the seccomp notification file descriptor
-       onto 'sockPair[0]' and then calls mkdir(2) for each directory in the
-       command-line arguments. */
+       onto 'sockPair[0]' and then exec with the command-line arguments. */
 
     targetPid = targetProcess(sockPair, &argv[optind], &opts);
 
@@ -1432,13 +1431,17 @@ main(int argc, char *argv[])
 
         /* Wait for the target process to terminate */
 
-        waitpid(targetPid, NULL, 0);
+        int status;
+        waitpid(targetPid, &status, 0);
         if(opts.debug) printf("Parent: target process has terminated\n");
 
         /* After the target process has terminated, kill the tracer process */
 
         if(opts.debug) printf("Parent: killing tracer\n");
         kill(tracerPid, SIGTERM);
+
+        if (!WIFEXITED(status)) exit(EXIT_FAILURE);
+        exit(WEXITSTATUS(status));
     }
 
     exit(EXIT_SUCCESS);
